@@ -9,6 +9,65 @@ app.use(cors());
 // ─── State ────────────────────────────────────────────────────────────────────
 let SC_CLIENT_ID = null;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const TRACK_CACHE = new Map();
+
+function cleanupText(s = '') {
+  return String(s)
+    .replace(/\s+/g, ' ')
+    .replace(/[^\S\r\n]+/g, ' ')
+    .trim();
+}
+
+function stripFeatures(s = '') {
+  return cleanupText(
+    s
+      .replace(/\\((feat|ft|featuring)[^)]+\\)/gi, '')
+      .replace(/\\[(feat|ft|featuring)[^\\]]+\]/gi, '')
+      .replace(/\b(feat|ft|featuring)\.?\s+[^-–|/]+/gi, '')
+  );
+}
+
+function parseArtistTitle(track) {
+  const rawTitle = cleanupText(track?.title || '');
+  const metaArtist = cleanupText(
+    track?.publisher_metadata?.artist ||
+    track?.publisher_metadata?.writer_composer ||
+    ''
+  );
+  const uploader = cleanupText(track?.user?.username || '');
+
+  if (rawTitle.includes(' - ')) {
+    const [left, ...rest] = rawTitle.split(' - ');
+    const right = rest.join(' - ').trim();
+    if (left && right) {
+      return {
+        artist: cleanupText(metaArtist || left),
+        title: cleanupText(right),
+        rawTitle,
+        uploader
+      };
+    }
+  }
+
+  return {
+    artist: cleanupText(metaArtist || uploader),
+    title: rawTitle,
+    rawTitle,
+    uploader
+  };
+}
+
+function rememberTrack(track) {
+  const meta = parseArtistTitle(track);
+  TRACK_CACHE.set(String(track.id), {
+    id: String(track.id),
+    artist: meta.artist,
+    title: meta.title,
+    rawTitle: meta.rawTitle,
+    uploader: meta.uploader,
+    artworkURL: track.artwork_url ? track.artwork_url.replace('-large', '-t500x500') : null
+  });
+}
 
 // ─── Headers ──────────────────────────────────────────────────────────────────
 // No 'br' — axios can't decompress brotli, returns undefined data
@@ -137,9 +196,6 @@ async function scGet(url, params = {}, retried = false) {
   }
 }
 
-// ─── YouTube Fallback via Piped API ───────────────────────────────────────────
-// Piped is an open-source YouTube proxy — no API key, no ytdl-core, no bans.
-// It returns direct, playable audio CDN URLs from YouTube's servers.
 const PIPED_INSTANCES = [
   'https://pipedapi.kavin.rocks',
   'https://piped-api.garudalinux.org',
@@ -153,49 +209,113 @@ async function pipedGet(path, params = {}) {
       const { data } = await axios.get(`${base}${path}`, {
         params,
         headers: { 'User-Agent': PAGE_HEADERS['User-Agent'] },
-        timeout: 8000,
+        timeout: 10000,
       });
       if (data) return data;
-    } catch { continue; }
+    } catch {}
   }
   return null;
 }
 
-async function youtubeSearch(query) {
-  const data = await pipedGet('/search', { q: query, filter: 'music_songs' });
-  const items = data?.items || [];
-  // Find first video result
-  const video = items.find(i => i.type === 'stream');
-  if (!video) return null;
-  const m = (video.url || '').match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+function extractVideoIdFromAny(item) {
+  if (!item) return null;
+
+  if (typeof item.id === 'string' && /^[a-zA-Z0-9_-]{11}$/.test(item.id)) {
+    return item.id;
+  }
+
+  if (typeof item.videoId === 'string' && /^[a-zA-Z0-9_-]{11}$/.test(item.videoId)) {
+    return item.videoId;
+  }
+
+  const url = item.url || item.videoUrl || '';
+  const m = String(url).match(/(?:v=|\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
   return m ? m[1] : null;
+}
+
+function scoreCandidate(item, query) {
+  const hay = cleanupText(`${item?.title || item?.name || ''} ${item?.uploaderName || item?.uploader || ''}`).toLowerCase();
+  const needles = cleanupText(query).toLowerCase().split(' ').filter(Boolean);
+  return needles.reduce((n, token) => n + (hay.includes(token) ? 1 : 0), 0);
+}
+
+async function pipedSearchOnce(query, filter) {
+  const data = await pipedGet('/search', filter ? { q: query, filter } : { q: query });
+  const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
+  if (!items.length) return null;
+
+  const ranked = items
+    .map(item => ({ item, id: extractVideoIdFromAny(item), score: scoreCandidate(item, query) }))
+    .filter(x => x.id)
+    .sort((a, b) => b.score - a.score);
+
+  return ranked[0]?.id || null;
+}
+
+async function youtubeSearch(title, artist) {
+  const cleanTitle = cleanupText(title);
+  const cleanArtist = cleanupText(artist);
+
+  const queries = [
+    `${cleanArtist} ${cleanTitle}`,
+    `${cleanTitle} ${cleanArtist}`,
+    `${stripFeatures(cleanTitle)} ${cleanArtist}`,
+    `${cleanArtist} ${stripFeatures(cleanTitle)}`,
+    cleanTitle,
+    stripFeatures(cleanTitle),
+    `${cleanArtist} ${cleanTitle} audio`,
+  ].map(cleanupText).filter(Boolean);
+
+  for (const q of [...new Set(queries)]) {
+    console.log(`[YT] Search query: "${q}"`);
+
+    const id1 = await pipedSearchOnce(q, 'music_songs');
+    if (id1) return id1;
+
+    const id2 = await pipedSearchOnce(q, 'videos');
+    if (id2) return id2;
+
+    const id3 = await pipedSearchOnce(q);
+    if (id3) return id3;
+  }
+
+  return null;
 }
 
 async function youtubeStreamUrl(videoId) {
   const data = await pipedGet(`/streams/${videoId}`);
   if (!data) return null;
 
-  const streams = data.audioStreams || [];
-  // Prefer M4A (AAC) — best Eclipse compatibility
-  const m4a   = streams.find(s => s.mimeType?.includes('mp4') || s.format === 'M4A');
-  const chosen = m4a || streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+  const streams = Array.isArray(data.audioStreams) ? data.audioStreams : [];
+  if (!streams.length) return null;
+
+  const direct = streams.filter(s => s?.url && /^https?:\/\//i.test(s.url));
+
+  const chosen =
+    direct.find(s => (s.mimeType || '').includes('audio/mp4')) ||
+    direct.find(s => (s.format || '').toUpperCase() === 'M4A') ||
+    direct.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
 
   if (!chosen?.url) return null;
+
   return {
-    url:     chosen.url,
-    format:  'm4a',
+    url: chosen.url,
+    format: 'm4a',
     quality: `${Math.round((chosen.bitrate || 128000) / 1000)}kbps`,
   };
 }
 
 async function youtubeFallback(title, artist) {
-  const query = `${title} ${artist}`.trim();
-  console.log(`[YT] Searching fallback: "${query}"`);
-  const videoId = await youtubeSearch(query);
-  if (!videoId) { console.log('[YT] No video found'); return null; }
-  console.log(`[YT] Found: ${videoId} — fetching stream URL`);
+  const videoId = await youtubeSearch(title, artist);
+  if (!videoId) {
+    console.log('[YT] No video found');
+    return null;
+  }
+
+  console.log(`[YT] Found videoId: ${videoId}`);
   return youtubeStreamUrl(videoId);
 }
+
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
@@ -225,20 +345,23 @@ app.get('/search', async (req, res) => {
       q, limit: 20, offset: 0, linked_partitioning: 1,
     });
 
-    const tracks = (data.collection || [])
-      // Filter hard-blocked tracks — they can't play even with YouTube fallback
-      .filter(t => t.streamable !== false)
-      .map(t => ({
-        id:         String(t.id),
-        title:      t.title          || 'Unknown Title',
-        artist:     t.user?.username || 'Unknown Artist',
-        album:      null,
-        duration:   t.duration ? Math.floor(t.duration / 1000) : null,
-        artworkURL: t.artwork_url ? t.artwork_url.replace('-large', '-t500x500') : null,
-        format:     'aac',
-        // store policy flag in a non-standard field for stream endpoint awareness
-        _policy:    t.policy || null,
-      }));
+const tracks = (data.collection || [])
+  .filter(t => t.streamable !== false)
+  .map(t => {
+    rememberTrack(t);
+    const meta = parseArtistTitle(t);
+
+    return {
+      id:         String(t.id),
+      title:      meta.title || 'Unknown Title',
+      artist:     meta.artist || 'Unknown Artist',
+      album:      null,
+      duration:   t.duration ? Math.floor(t.duration / 1000) : null,
+      artworkURL: t.artwork_url ? t.artwork_url.replace('-large', '-t500x500') : null,
+      format:     'aac',
+    };
+  });
+));
 
     res.json({ tracks });
   } catch (err) {
@@ -255,8 +378,8 @@ app.get('/stream/:id', async (req, res) => {
 
   const trackId = req.params.id;
   let track = null;
+  let cached = TRACK_CACHE.get(String(trackId)) || null;
 
-  // ── Step 1: Get track info (needed for YouTube fallback title/artist) ────────
   try {
     try {
       track = await scGet(`https://api-v2.soundcloud.com/tracks/soundcloud:tracks:${trackId}`);
@@ -264,30 +387,31 @@ app.get('/stream/:id', async (req, res) => {
       track = await scGet(`https://api-v2.soundcloud.com/tracks/${trackId}`);
     }
   } catch (err) {
-    console.error('[/stream] Track lookup failed:', err.message);
-    return res.status(500).json({ error: 'Failed to fetch track info' });
+    console.warn(`[/stream] Track lookup failed: ${err.message}`);
   }
 
-  // ── Step 2: Try SoundCloud stream (skip BLOCK policy immediately) ────────────
-  const policy = track?.policy;
-  const isSCBlocked = policy === 'BLOCK';
+  if (track) {
+    rememberTrack(track);
+    cached = TRACK_CACHE.get(String(trackId)) || cached;
+  }
 
-  if (!isSCBlocked) {
+  // 1) Try SoundCloud first if we have a track object
+  if (track && track.policy !== 'BLOCK') {
     try {
       const transcodings = track?.media?.transcodings || [];
       const chosen =
-        transcodings.find(t => t.format?.protocol === 'hls' && t.format?.mime_type?.includes('aac'))  ||
-        transcodings.find(t => t.format?.protocol === 'hls' && t.format?.mime_type?.includes('mpeg')) ||
-        transcodings.find(t => t.format?.protocol === 'progressive')                                  ||
+        transcodings.find(t => t.format?.protocol === 'hls' && t.format?.mime_type?.includes('aac')) ||
+        transcodings.find(t => t.format?.protocol === 'hls') ||
+        transcodings.find(t => t.format?.protocol === 'progressive') ||
         transcodings[0];
 
       if (chosen?.url) {
         const streamData = await scGet(chosen.url);
         if (streamData?.url) {
-          console.log(`[/stream] ✓ SoundCloud stream for track ${trackId}`);
+          console.log(`[/stream] ✓ SoundCloud stream for ${trackId}`);
           return res.json({
-            url:     streamData.url,
-            format:  chosen.format?.mime_type?.includes('aac') ? 'aac' : 'mp3',
+            url: streamData.url,
+            format: chosen.format?.mime_type?.includes('aac') ? 'aac' : 'mp3',
             quality: '160kbps',
           });
         }
@@ -295,32 +419,23 @@ app.get('/stream/:id', async (req, res) => {
     } catch (err) {
       console.warn(`[/stream] SoundCloud stream failed: ${err.message}`);
     }
-  } else {
-    console.log(`[/stream] Track ${trackId} is BLOCK policy — skipping SoundCloud, going straight to YouTube`);
   }
 
-  // ── Step 3: YouTube fallback ─────────────────────────────────────────────────
-  const title  = track?.title          || '';
-  const artist = track?.user?.username || '';
+  // 2) Fallback to YouTube using cached or live metadata
+  const meta = track ? parseArtistTitle(track) : cached;
 
-  if (!title) {
-    return res.status(404).json({ error: 'No SoundCloud stream and no track info for YouTube fallback' });
+  if (!meta?.title) {
+    return res.status(404).json({ error: 'No SoundCloud stream and no metadata for YouTube fallback' });
   }
 
-  const ytResult = await youtubeFallback(title, artist);
-  if (ytResult) {
-    console.log(`[/stream] ✓ YouTube fallback succeeded for "${title}"`);
-    return res.json(ytResult);
+  const yt = await youtubeFallback(meta.title, meta.artist || meta.uploader || '');
+  if (yt) {
+    console.log(`[/stream] ✓ YouTube fallback for "${meta.artist} - ${meta.title}"`);
+    return res.json(yt);
   }
 
-  console.warn(`[/stream] Both SoundCloud and YouTube failed for "${title}"`);
   return res.status(404).json({
-    error: `"${title}" is not streamable on SoundCloud and could not be found on YouTube.`,
+    error: `No playable SoundCloud stream and no YouTube fallback for "${meta.artist || ''} ${meta.title}"`.trim()
   });
 });
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', clientIdReady: !!SC_CLIENT_ID, timestamp: new Date().toISOString() });
-});
-
-app.listen(PORT, () => console.log(`🎵 SoundCloud + YouTube Fallback Addon on port ${PORT}`));
