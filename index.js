@@ -49,15 +49,16 @@ const SCRIPT_HEADERS = {
   'Sec-Fetch-Site':  'cross-site',
 };
 
-// ─── Pattern Matching ─────────────────────────────────────────────────────────
-// Matches 20-36 char alphanumeric IDs (SoundCloud uses 32 chars currently)
+// ─── Pattern Matching (same as before) ───────────────────────────────────────
 const CLIENT_ID_RES = [
+  /[,{(\s]client_id\s*[:=]\s*["']([a-zA-Z0-9]{32})["']/,
+  /"client_id"\s*:\s*"([a-zA-Z0-9]{32})"/,
+  /"client_id","([a-zA-Z0-9]{32})"/,
+  /client_id=([a-zA-Z0-9]{32})[&"'\s,)]/,
+  /clientId\s*[:=]\s*["']([a-zA-Z0-9]{32})["']/,
+  /\?client_id=([a-zA-Z0-9]{32})/,
+  // broader fallback — 20-36 chars
   /[,{(\s]client_id\s*[:=]\s*["']([a-zA-Z0-9]{20,36})["']/,
-  /"client_id"\s*:\s*"([a-zA-Z0-9]{20,36})"/,
-  /"client_id","([a-zA-Z0-9]{20,36})"/,
-  /client_id=([a-zA-Z0-9]{20,36})[&"'\s,)]/,
-  /clientId\s*[:=]\s*["']([a-zA-Z0-9]{20,36})["']/,
-  /\?client_id=([a-zA-Z0-9]{20,36})/,
 ];
 
 function findClientId(text) {
@@ -68,126 +69,87 @@ function findClientId(text) {
   return null;
 }
 
-// ─── HTTP Helpers ─────────────────────────────────────────────────────────────
-async function fetchPage(url, extraHeaders = {}) {
-  try {
-    const res = await httpClient.get(url, {
-      headers:        { ...PAGE_HEADERS, ...extraHeaders },
-      timeout:        20000,
-      maxRedirects:   5,
-      validateStatus: s => s < 500,
-      // Explicit decompress: true ensures axios uses its gzip handler
-      decompress: true,
-    });
-    const html = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-    console.log(`[SC] ${url} → HTTP ${res.status} | ${html.length} bytes`);
-
-    // Diagnostic: short responses usually mean a bot-check page
-    if (html.length < 3000) {
-      console.warn(`[SC] ⚠ Short response — possible bot-protection page`);
-      console.warn(`[SC] Preview: ${html.slice(0, 400).replace(/\s+/g, ' ')}`);
-    }
-    return html;
-  } catch (err) {
-    console.warn(`[SC] ✗ ${url}: ${err.message}`);
-    return null;
-  }
-}
-
+// ─── Script Fetcher ───────────────────────────────────────────────────────────
 async function fetchScript(url, referer) {
   try {
-    const {  js } = await axios.get(url, {
-      headers:    { ...SCRIPT_HEADERS, Referer: referer },
+    const {  js, status } = await axios.get(url, {
+      headers: {
+        'User-Agent':      PAGE_HEADERS['User-Agent'],
+        'Accept':          '*/*',
+        'Accept-Encoding': 'gzip, deflate',
+        'Referer':         referer,
+        'Sec-Fetch-Dest':  'script',
+        'Sec-Fetch-Mode':  'no-cors',
+        'Sec-Fetch-Site':  'cross-site',
+      },
       timeout:    15000,
       decompress: true,
+      validateStatus: s => s < 500,
     });
-    return typeof js === 'string' ? js : JSON.stringify(js);
-  } catch {
+    const text = typeof js === 'string' ? js : JSON.stringify(js);
+    console.log(`[script] ${url.split('/').pop()} → ${status}, ${text.length} bytes`);
+    return text;
+  } catch (err) {
+    console.warn(`[script] FAILED ${url.split('/').pop()}: ${err.message}`);
     return null;
   }
 }
 
-// ─── Script Scanning ──────────────────────────────────────────────────────────
-async function scanScriptsForClientId(html, origin) {
-  // Collect all script src URLs — both absolute and relative
-  const urls = new Set();
-  for (const [, src] of html.matchAll(/src=["']([^"']+\.js[^"']{0,30})["']/g)) {
-    const full = src.startsWith('http') ? src : `${origin}${src.startsWith('/') ? '' : '/'}${src}`;
-    // Only check SoundCloud/sndcdn assets
-    if (full.includes('sndcdn') || full.includes('soundcloud') || full.includes('/assets/')) {
-      urls.add(full);
-    }
-  }
-
-  const list = [...urls].reverse().slice(0, 10);
-  console.log(`[SC] Checking ${list.length} script(s) from ${origin}`);
-
-  for (const url of list) {
-    const js = await fetchScript(url, origin + '/');
-    if (!js) continue;
-    const id = findClientId(js);
-    if (id) {
-      console.log(`[SC] ✓ client_id found in script: ${url}`);
-      return id;
-    }
-  }
-  return null;
-}
-
-// ─── Multi-Strategy Extraction ────────────────────────────────────────────────
+// ─── Extraction ───────────────────────────────────────────────────────────────
 async function extractClientId() {
-  const strategies = [
-    // ── Strategy A: Main site pages ──────────────────────────────────────────
-    { url: 'https://soundcloud.com',             origin: 'https://soundcloud.com' },
-    { url: 'https://soundcloud.com/discover',    origin: 'https://soundcloud.com' },
-    { url: 'https://soundcloud.com/charts/top',  origin: 'https://soundcloud.com' },
-
-    // ── Strategy B: Widget embed (different subdomain = different CF rules) ──
-    {
-      url:    'https://w.soundcloud.com/player/?url=https%3A//soundcloud.com/forss/flickermood&show_artwork=true',
-      origin: 'https://w.soundcloud.com',
-      extra:  { Referer: 'https://soundcloud.com/', Origin: 'https://soundcloud.com' },
-    },
-    {
-      url:    'https://w.soundcloud.com/player/?url=https%3A//soundcloud.com/charliexcx/360',
-      origin: 'https://w.soundcloud.com',
-      extra:  { Referer: 'https://soundcloud.com/', Origin: 'https://soundcloud.com' },
-    },
-
-    // ── Strategy C: Mobile UA (different CF fingerprint) ─────────────────────
-    {
-      url:    'https://soundcloud.com',
-      origin: 'https://soundcloud.com',
-      extra:  {
-        'User-Agent':       'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-        'Sec-Ch-Ua-Mobile': '?1',
-      },
-    },
-  ];
-
-  // Warm up cookies first — mimics a real browser flow
+  // Warm-up to establish cookies
   try {
     await httpClient.get('https://soundcloud.com/', { headers: PAGE_HEADERS, timeout: 10000 });
     console.log('[SC] Cookie warm-up done');
   } catch { /* non-fatal */ }
 
-  for (const { url, origin, extra = {} } of strategies) {
-    const html = await fetchPage(url, extra);
+  const pages = [
+    { url: 'https://soundcloud.com',          origin: 'https://soundcloud.com' },
+    { url: 'https://soundcloud.com/discover', origin: 'https://soundcloud.com' },
+  ];
+
+  for (const { url, origin } of pages) {
+    const html = await fetchPage(url);
     if (!html) continue;
 
-    // 1. Check raw HTML body
+    // ── Step 1: Check raw HTML and inline <script> blocks ─────────────────────
     const rawId = findClientId(html);
     if (rawId) { console.log('[SC] ✓ Found in raw HTML'); return rawId; }
 
-    // 2. Check inline <script> tags
     for (const [, content] of html.matchAll(/<script(?![^>]*src)[^>]*>([\s\S]*?)<\/script>/g)) {
       const id = findClientId(content);
       if (id) { console.log('[SC] ✓ Found in inline <script>'); return id; }
     }
 
-    // 3. Scan external JS bundles
-    const bundleId = await scanScriptsForClientId(html, origin);
-    if (bundleId) return bundleId;
+    // ── Step 2: THE KEY FIX — find CDN bundle URLs anywhere in the HTML ───────
+    // SoundCloud's webpack bootstrap embeds bundle URLs as string literals
+    // inside inline JS, NOT as <script src=""> attributes.
+    // e.g.: __webpack_require__.u=()=>"https://a-v2.sndcdn.com/assets/app-abc.js"
+    const cdnUrls = [
+      ...new Set([
+        // Absolute a-v2.sndcdn.com asset URLs anywhere in the HTML text
+        ...[...html.matchAll(/https?:\/\/a-v2\.sndcdn\.com\/assets\/[a-zA-Z0-9._-]+\.js/g)]
+          .map(m => m[0]),
+        // Any sndcdn.com .js URL
+        ...[...html.matchAll(/https?:\/\/[a-z0-9-]+\.sndcdn\.com\/[a-zA-Z0-9._\/-]+\.js/g)]
+          .map(m => m[0]),
+        // Also grab <script src="..."> attributes as a secondary source
+        ...[...html.matchAll(/src=["'](https?:\/\/[^"']*\.js[^"']{0,20})["']/g)]
+          .map(m => m[1])
+          .filter(u => u.includes('sndcdn') || u.includes('/assets/')),
+      ])
+    ];
+
+    console.log(`[SC] Found ${cdnUrls.length} CDN bundle URL(s) in HTML:`);
+    cdnUrls.forEach(u => console.log(`  → ${u.split('/').pop()}`));
+
+    // Check in reverse — the app bundle (containing client_id) is always last
+    for (const scriptUrl of [...cdnUrls].reverse()) {
+      const js = await fetchScript(scriptUrl, origin + '/');
+      if (!js) continue;
+      const id = findClientId(js);
+      if (id) { console.log(`[SC] ✓ Found client_id in bundle`); return id; }
+    }
   }
 
   throw new Error('client_id not found across all strategies');
@@ -195,6 +157,14 @@ async function extractClientId() {
 
 // ─── Client ID Manager ────────────────────────────────────────────────────────
 async function getClientId() {
+  // ── Priority 1: Manual override via Render environment variable ───────────
+  // Set SC_CLIENT_ID in Render's Environment tab for instant reliability.
+  // Find it: open soundcloud.com → DevTools → Network → any api-v2.soundcloud.com
+  // request → copy the client_id query parameter.
+  if (process.env.SC_CLIENT_ID) {
+    return process.env.SC_CLIENT_ID;
+  }
+
   if (cachedClientId) return cachedClientId;
   if (fetchingPromise) return fetchingPromise;
 
@@ -211,7 +181,6 @@ async function getClientId() {
       } catch (err) {
         console.error(`[client_id] ✗ Attempt ${i}: ${err.message}`);
         if (i < MAX) {
-          // Linear back-off capped at 2 minutes
           const delay = Math.min(10000 * i, 120000);
           console.log(`[client_id] Retrying in ${delay / 1000}s…`);
           await sleep(delay);
