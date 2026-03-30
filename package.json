@@ -1,7 +1,7 @@
 {
   "name": "soundcloud-eclipse-addon",
-  "version": "1.6.0",
-  "description": "SoundCloud addon for Eclipse Music",
+  "version": "2.0.0",
+  "description": "SoundCloud addon with YouTube fallback for Eclipse Music",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "dependencies": {
