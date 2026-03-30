@@ -1,15 +1,17 @@
 {
   "name": "soundcloud-eclipse-addon",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "description": "SoundCloud addon for Eclipse Music",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "axios":   "^1.7.0",
-    "cors":    "^2.8.5",
-    "express": "^4.19.0"
+    "axios":                    "^1.7.0",
+    "axios-cookiejar-support":  "^4.0.7",
+    "cors":                     "^2.8.5",
+    "express":                  "^4.19.0",
+    "tough-cookie":             "^4.1.4"
   },
   "engines": {
     "node": ">=18.0.0"
