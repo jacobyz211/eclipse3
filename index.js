@@ -216,8 +216,6 @@ async function scGet(clientId, url, params, retried) {
 }
 
 // ─── Resolve stub tracks ──────────────────────────────────────────────────────
-// SoundCloud returns placeholder objects with only an id and no title inside
-// playlists and albums. This fetches the full data for all stubs in batches.
 async function resolveStubTracks(cid, rawTracks, fallbackArtwork) {
   var stubIds = rawTracks
     .filter(function(t) { return !t.title; })
@@ -299,9 +297,99 @@ async function youtubeFallback(title, artist) {
   return youtubeStreamUrl(videoId);
 }
 
+// ─── URL type detection ───────────────────────────────────────────────────────
+function detectUrlType(url) {
+  if (!url) return null;
+
+  // SoundCloud playlist/album/set
+  if (/soundcloud\.com\/.+\/sets\/.+/.test(url)) return 'sc_playlist';
+  // SoundCloud single track
+  if (/soundcloud\.com\/[^/]+\/[^/]+/.test(url) && !/\/sets\//.test(url)) return 'sc_track';
+
+  // YouTube Music playlist
+  var ytmPl = url.match(/(?:music\.youtube\.com|youtube\.com).*[?&]list=([a-zA-Z0-9_-]+)/);
+  if (ytmPl) return 'ytm_playlist';
+
+  // YouTube Music single track
+  if (/music\.youtube\.com\/watch/.test(url) || /youtube\.com\/watch/.test(url)) return 'yt_track';
+
+  return null;
+}
+
+function extractYtmPlaylistId(url) {
+  var m = url.match(/[?&]list=([a-zA-Z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+// ─── Import a SoundCloud playlist/album by URL ────────────────────────────────
+async function importScPlaylist(cid, scUrl) {
+  // SC resolve turns any soundcloud.com URL into the resource JSON
+  var resource = await scGet(cid, 'https://api-v2.soundcloud.com/resolve', { url: scUrl });
+  if (!resource) throw new Error('Could not resolve SoundCloud URL');
+
+  var kind = resource.kind; // 'playlist' covers both albums and playlists
+  if (kind !== 'playlist') throw new Error('URL is not a playlist or album (kind: ' + kind + ')');
+
+  var resolved = await resolveStubTracks(cid, resource.tracks || [], resource.artwork_url);
+
+  var tracks = resolved.map(function(t) {
+    rememberTrack(t);
+    var meta = parseArtistTitle(t);
+    return {
+      id:         String(t.id),
+      title:      meta.title  || t.title || 'Unknown',
+      artist:     meta.artist || (resource.user && resource.user.username) || 'Unknown',
+      duration:   t.duration ? Math.floor(t.duration / 1000) : null,
+      artworkURL: artworkUrl(t.artwork_url, resource.artwork_url)
+    };
+  });
+
+  return {
+    id:          String(resource.id),
+    title:       resource.title || 'Imported Playlist',
+    description: resource.description || null,
+    artworkURL:  artworkUrl(resource.artwork_url),
+    creator:     (resource.user && resource.user.username) || null,
+    tracks:      tracks
+  };
+}
+
+// ─── Import a YouTube Music playlist by URL ───────────────────────────────────
+async function importYtmPlaylist(playlistId) {
+  // Piped supports YTM/YT playlist IDs natively
+  var data = await pipedGet('/playlists/' + playlistId);
+  if (!data) throw new Error('Could not fetch YTM playlist from Piped');
+
+  var rawTracks = Array.isArray(data.relatedStreams) ? data.relatedStreams : [];
+
+  var tracks = rawTracks
+    .filter(function(item) { return item && item.title; })
+    .map(function(item) {
+      var vidId = extractYouTubeId(item);
+      return {
+        // prefix ytm_ so stream route knows to use Piped
+        id:         'ytm_' + (vidId || String(item.url || '')),
+        title:      cleanText(item.title),
+        artist:     cleanText(item.uploaderName || item.uploader || 'Unknown'),
+        duration:   item.duration || null,
+        artworkURL: item.thumbnail || null
+      };
+    })
+    .filter(function(t) { return t.id && t.title; });
+
+  return {
+    id:          'ytm_' + playlistId,
+    title:       cleanText(data.name || 'YouTube Music Playlist'),
+    description: null,
+    artworkURL:  data.thumbnailUrl || null,
+    creator:     cleanText(data.uploader || 'YouTube Music'),
+    tracks:      tracks
+  };
+}
+
 // ─── Config page ──────────────────────────────────────────────────────────────
 function buildConfigPage(baseUrl) {
-  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Eclipse \u2022 SoundCloud Addon</title><style>*{box-sizing:border-box;margin:0;padding:0}body{background:#0f0f0f;color:#e8e8e8;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px 64px}.logo{margin-bottom:20px}.card{background:#161616;border:1px solid #232323;border-radius:18px;padding:36px;max-width:540px;width:100%;box-shadow:0 24px 64px rgba(0,0,0,.5)}h1{font-size:22px;font-weight:700;margin-bottom:6px;color:#fff}p.sub{font-size:14px;color:#777;margin-bottom:26px;line-height:1.6}.save-tip{background:#0d1f0d;border:1px solid #1a3a1a;border-radius:10px;padding:12px 14px;margin-bottom:20px;font-size:12px;color:#5a9e5a;line-height:1.7}.save-tip strong{color:#7cc97c}.pills{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:28px}.pill{background:#1a2218;color:#6db86d;border:1px solid #2d422a;border-radius:20px;font-size:11px;font-weight:600;padding:4px 10px}.pill.orange{background:#1f1500;color:#f50;border-color:#3a2500}.label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#555;margin-bottom:8px}input[type=text]{width:100%;background:#0f0f0f;border:1px solid #222;border-radius:10px;color:#e8e8e8;font-size:14px;padding:12px 14px;margin-bottom:8px;outline:none;transition:border-color .15s}input[type=text]:focus{border-color:#f50}input[type=text]::placeholder{color:#333}.hint{font-size:12px;color:#484848;margin-bottom:28px;line-height:1.7}.hint code{background:#1a1a1a;padding:1px 5px;border-radius:4px;color:#888}.hint a{color:#f50;text-decoration:none}button.primary{width:100%;background:#f50;border:none;border-radius:10px;color:#fff;font-size:15px;font-weight:700;padding:14px;cursor:pointer;transition:background .15s;margin-bottom:18px}button.primary:hover{background:#d94a00}button.primary:disabled{background:#252525;color:#444;cursor:not-allowed}.result{display:none;background:#0f0f0f;border:1px solid #1e1e1e;border-radius:12px;padding:18px;margin-bottom:18px}.rlabel{font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}.rurl{font-size:12px;color:#f50;word-break:break-all;font-family:"SF Mono",monospace;margin-bottom:14px;line-height:1.5}button.copy{width:100%;background:#1a1a1a;border:1px solid #222;border-radius:8px;color:#aaa;font-size:13px;font-weight:600;padding:10px;cursor:pointer;transition:all .15s}button.copy:hover{background:#202020;color:#fff}.divider{border:none;border-top:1px solid #1a1a1a;margin:28px 0}.steps{display:flex;flex-direction:column;gap:14px}.step{display:flex;gap:14px;align-items:flex-start}.step-n{background:#1a1a1a;border:1px solid #252525;border-radius:50%;width:26px;height:26px;min-width:26px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#666}.step-t{font-size:13px;color:#666;line-height:1.6}.step-t strong{color:#aaa}.warn{background:#140f00;border:1px solid #2e2000;border-radius:10px;padding:14px 16px;margin-top:24px;font-size:12px;color:#8a6a00;line-height:1.7}footer{margin-top:36px;font-size:12px;color:#333;text-align:center;line-height:1.8}</style></head><body><svg class="logo" width="52" height="52" viewBox="0 0 52 52" fill="none"><circle cx="26" cy="26" r="26" fill="#f50"/><path d="M15 30c0-2.4 2-4.4 4.4-4.4s4.4 2 4.4 4.4" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/><path d="M10.5 30c0-4.9 4-8.9 8.9-8.9s8.9 4 8.9 8.9" stroke="#fff" stroke-width="2.5" stroke-linecap="round" opacity=".55"/><rect x="30" y="21" width="3.5" height="17" rx="1.75" fill="#fff"/><rect x="35.5" y="18" width="3.5" height="20" rx="1.75" fill="#fff"/><rect x="41" y="23" width="3.5" height="15" rx="1.75" fill="#fff"/></svg><div class="card"><h1>SoundCloud for Eclipse</h1><div class="save-tip">\ud83d\udcbe <strong>Save your URL somewhere safe</strong> \u2014 copy it to Notes, a bookmark, or anywhere you can find it later. If the server ever updates, paste it into the \u201cRefresh\u201d section below to keep all your playlists working without generating a new link.</div><p class="sub">Generate your personal addon URL. Your URL is isolated from every other user \u2014 independent rate limits, independent client ID.</p><div class="pills"><span class="pill">\u2713 Unique per user</span><span class="pill">\u2713 Persists across restarts</span><span class="pill orange">\u2713 YouTube fallback</span></div><div class="label">Your SoundCloud Client ID <span style="color:#3a3a3a;font-weight:400;text-transform:none">(optional but recommended)</span></div><input type="text" id="clientId" placeholder="Leave blank to use the shared auto-refreshed ID"><div class="hint">Want your own? Open <a href="https://soundcloud.com" target="_blank">soundcloud.com</a>, press F12 &rarr; Network tab &rarr; filter by <code>api-v2</code> &rarr; copy the <code>client_id=</code> value from any request.</div><button class="primary" id="genBtn" onclick="generate()">Generate My Addon URL</button><div class="result" id="result"><div class="rlabel">Your addon URL \u2014 paste this into Eclipse</div><div class="rurl" id="rurl"></div><button class="copy" onclick="copyUrl()">\u29c3 Copy URL</button></div><hr class="divider"><div class="label">Already have a URL? Refresh it \u2014 keeps playlists working</div><input type="text" id="existingUrl" placeholder="Paste your existing addon URL here"><div class="hint">Paste your old URL and hit Refresh \u2014 the URL stays <strong style="color:#aaa">exactly the same</strong> so every saved playlist track keeps working. Optionally update your Client ID above first.</div><button class="primary" id="refBtn" onclick="doRefresh()" style="background:#0d2a14;border:1px solid #1a4a20">\u21bb Refresh Existing URL</button><div class="result" id="refResult"><div class="rlabel">Refreshed \u2014 same URL, still works in Eclipse</div><div class="rurl" id="rrurl"></div><button class="copy" onclick="copyRefUrl()">\u29c3 Copy URL</button></div><hr class="divider"><div class="steps"><div class="step"><div class="step-n">1</div><div class="step-t">Generate and copy your URL above</div></div><div class="step"><div class="step-n">2</div><div class="step-t">Open <strong>Eclipse Music</strong> \u2192 Library \u2192 Cloud \u2192 Add Connection \u2192 Addon</div></div><div class="step"><div class="step-n">3</div><div class="step-t">Paste your URL and tap Install</div></div><div class="step"><div class="step-n">4</div><div class="step-t"><strong>SoundCloud</strong> appears in your search dropdown. Tracks, albums, artists, and playlists all searchable</div></div></div><div class="warn">\u26a0\ufe0f Your URL is saved permanently to Redis \u2014 it survives server restarts. Bookmark this page if you need to regenerate.</div></div><footer>Eclipse SoundCloud Addon &bull; <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer><script>var gurl="";var rurl2="";function generate(){var btn=document.getElementById("genBtn");var cid=document.getElementById("clientId").value.trim();btn.disabled=true;btn.textContent="Generating...";fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({clientId:cid||null})}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}gurl=d.manifestUrl;document.getElementById("rurl").textContent=gurl;document.getElementById("result").style.display="block";btn.textContent="Regenerate URL";btn.disabled=false;}).catch(function(e){alert("Request failed: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}function copyUrl(){if(!gurl)return;navigator.clipboard.writeText(gurl).then(function(){var b=document.querySelector(".copy");b.textContent="Copied!";setTimeout(function(){b.textContent="\u29c3 Copy URL";},1500);});}function doRefresh(){var btn=document.getElementById("refBtn");var eu=document.getElementById("existingUrl").value.trim();var cid=document.getElementById("clientId").value.trim();if(!eu){alert("Paste your existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu,clientId:cid||null})}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="\u21bb Refresh Existing URL";return;}rurl2=d.manifestUrl;document.getElementById("rrurl").textContent=rurl2;document.getElementById("refResult").style.display="block";btn.textContent="\u21bb Refresh Again";btn.disabled=false;}).catch(function(e){alert("Request failed: "+e.message);btn.disabled=false;btn.textContent="\u21bb Refresh Existing URL";});}function copyRefUrl(){if(!rurl2)return;navigator.clipboard.writeText(rurl2).then(function(){var b=document.getElementById("refResult").querySelector(".copy");b.textContent="Copied!";setTimeout(function(){b.textContent="\u29c3 Copy URL";},1500);});}document.getElementById("clientId").addEventListener("keydown",function(e){if(e.key==="Enter")generate();});<\/script></body></html>';
+  return '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Eclipse \u2022 SoundCloud Addon</title><style>*{box-sizing:border-box;margin:0;padding:0}body{background:#0f0f0f;color:#e8e8e8;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px 64px}.logo{margin-bottom:20px}.card{background:#161616;border:1px solid #232323;border-radius:18px;padding:36px;max-width:540px;width:100%;box-shadow:0 24px 64px rgba(0,0,0,.5)}h1{font-size:22px;font-weight:700;margin-bottom:6px;color:#fff}p.sub{font-size:14px;color:#777;margin-bottom:26px;line-height:1.6}.save-tip{background:#0d1f0d;border:1px solid #1a3a1a;border-radius:10px;padding:12px 14px;margin-bottom:20px;font-size:12px;color:#5a9e5a;line-height:1.7}.save-tip strong{color:#7cc97c}.pills{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:28px}.pill{background:#1a2218;color:#6db86d;border:1px solid #2d422a;border-radius:20px;font-size:11px;font-weight:600;padding:4px 10px}.pill.orange{background:#1f1500;color:#f50;border-color:#3a2500}.pill.blue{background:#001a2e;color:#4a9eff;border-color:#003a6e}.label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#555;margin-bottom:8px}input[type=text]{width:100%;background:#0f0f0f;border:1px solid #222;border-radius:10px;color:#e8e8e8;font-size:14px;padding:12px 14px;margin-bottom:8px;outline:none;transition:border-color .15s}input[type=text]:focus{border-color:#f50}input[type=text]::placeholder{color:#333}.hint{font-size:12px;color:#484848;margin-bottom:28px;line-height:1.7}.hint code{background:#1a1a1a;padding:1px 5px;border-radius:4px;color:#888}.hint a{color:#f50;text-decoration:none}button.primary{width:100%;background:#f50;border:none;border-radius:10px;color:#fff;font-size:15px;font-weight:700;padding:14px;cursor:pointer;transition:background .15s;margin-bottom:18px}button.primary:hover{background:#d94a00}button.primary:disabled{background:#252525;color:#444;cursor:not-allowed}.result{display:none;background:#0f0f0f;border:1px solid #1e1e1e;border-radius:12px;padding:18px;margin-bottom:18px}.rlabel{font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}.rurl{font-size:12px;color:#f50;word-break:break-all;font-family:"SF Mono",monospace;margin-bottom:14px;line-height:1.5}button.copy{width:100%;background:#1a1a1a;border:1px solid #222;border-radius:8px;color:#aaa;font-size:13px;font-weight:600;padding:10px;cursor:pointer;transition:all .15s}button.copy:hover{background:#202020;color:#fff}.divider{border:none;border-top:1px solid #1a1a1a;margin:28px 0}.steps{display:flex;flex-direction:column;gap:14px}.step{display:flex;gap:14px;align-items:flex-start}.step-n{background:#1a1a1a;border:1px solid #252525;border-radius:50%;width:26px;height:26px;min-width:26px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#666}.step-t{font-size:13px;color:#666;line-height:1.6}.step-t strong{color:#aaa}.warn{background:#140f00;border:1px solid #2e2000;border-radius:10px;padding:14px 16px;margin-top:24px;font-size:12px;color:#8a6a00;line-height:1.7}footer{margin-top:36px;font-size:12px;color:#333;text-align:center;line-height:1.8}</style></head><body><svg class="logo" width="52" height="52" viewBox="0 0 52 52" fill="none"><circle cx="26" cy="26" r="26" fill="#f50"/><path d="M15 30c0-2.4 2-4.4 4.4-4.4s4.4 2 4.4 4.4" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/><path d="M10.5 30c0-4.9 4-8.9 8.9-8.9s8.9 4 8.9 8.9" stroke="#fff" stroke-width="2.5" stroke-linecap="round" opacity=".55"/><rect x="30" y="21" width="3.5" height="17" rx="1.75" fill="#fff"/><rect x="35.5" y="18" width="3.5" height="20" rx="1.75" fill="#fff"/><rect x="41" y="23" width="3.5" height="15" rx="1.75" fill="#fff"/></svg><div class="card"><h1>SoundCloud for Eclipse</h1><div class="save-tip">\ud83d\udcbe <strong>Save your URL somewhere safe</strong> \u2014 copy it to Notes, a bookmark, or anywhere you can find it later. If the server ever updates, paste it into the \u201cRefresh\u201d section below to keep all your playlists working without generating a new link.</div><p class="sub">Generate your personal addon URL. Your URL is isolated from every other user \u2014 independent rate limits, independent client ID.</p><div class="pills"><span class="pill">\u2713 Tracks, albums, artists</span><span class="pill">\u2713 SC playlists</span><span class="pill orange">\u2713 YouTube fallback</span><span class="pill blue">\u2713 YTM import</span></div><div class="label">Your SoundCloud Client ID <span style="color:#3a3a3a;font-weight:400;text-transform:none">(optional but recommended)</span></div><input type="text" id="clientId" placeholder="Leave blank to use the shared auto-refreshed ID"><div class="hint">Want your own? Open <a href="https://soundcloud.com" target="_blank">soundcloud.com</a>, press F12 &rarr; Network tab &rarr; filter by <code>api-v2</code> &rarr; copy the <code>client_id=</code> value from any request.</div><button class="primary" id="genBtn" onclick="generate()">Generate My Addon URL</button><div class="result" id="result"><div class="rlabel">Your addon URL \u2014 paste this into Eclipse</div><div class="rurl" id="rurl"></div><button class="copy" onclick="copyUrl()">\u29c3 Copy URL</button></div><hr class="divider"><div class="label">Already have a URL? Refresh it \u2014 keeps playlists working</div><input type="text" id="existingUrl" placeholder="Paste your existing addon URL here"><div class="hint">Paste your old URL and hit Refresh \u2014 the URL stays <strong style="color:#aaa">exactly the same</strong> so every saved playlist track keeps working. Optionally update your Client ID above first.</div><button class="primary" id="refBtn" onclick="doRefresh()" style="background:#0d2a14;border:1px solid #1a4a20">\u21bb Refresh Existing URL</button><div class="result" id="refResult"><div class="rlabel">Refreshed \u2014 same URL, still works in Eclipse</div><div class="rurl" id="rrurl"></div><button class="copy" onclick="copyRefUrl()">\u29c3 Copy URL</button></div><hr class="divider"><div class="steps"><div class="step"><div class="step-n">1</div><div class="step-t">Generate and copy your URL above</div></div><div class="step"><div class="step-n">2</div><div class="step-t">Open <strong>Eclipse Music</strong> \u2192 Settings \u2192 Connections \u2192 Add Connection \u2192 Addon</div></div><div class="step"><div class="step-n">3</div><div class="step-t">Paste your URL and tap Install</div></div><div class="step"><div class="step-n">4</div><div class="step-t">In Eclipse, go to <strong>Import Playlist</strong> and paste a SoundCloud or YouTube Music playlist URL</div></div></div><div class="warn">\u26a0\ufe0f Your URL is saved permanently to Redis \u2014 it survives server restarts. Bookmark this page if you need to regenerate.</div></div><footer>Eclipse SoundCloud Addon &bull; <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer><script>var gurl="";var rurl2="";function generate(){var btn=document.getElementById("genBtn");var cid=document.getElementById("clientId").value.trim();btn.disabled=true;btn.textContent="Generating...";fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({clientId:cid||null})}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}gurl=d.manifestUrl;document.getElementById("rurl").textContent=gurl;document.getElementById("result").style.display="block";btn.textContent="Regenerate URL";btn.disabled=false;}).catch(function(e){alert("Request failed: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}function copyUrl(){if(!gurl)return;navigator.clipboard.writeText(gurl).then(function(){var b=document.querySelector(".copy");b.textContent="Copied!";setTimeout(function(){b.textContent="\u29c3 Copy URL";},1500);});}function doRefresh(){var btn=document.getElementById("refBtn");var eu=document.getElementById("existingUrl").value.trim();var cid=document.getElementById("clientId").value.trim();if(!eu){alert("Paste your existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu,clientId:cid||null})}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="\u21bb Refresh Existing URL";return;}rurl2=d.manifestUrl;document.getElementById("rrurl").textContent=rurl2;document.getElementById("refResult").style.display="block";btn.textContent="\u21bb Refresh Again";btn.disabled=false;}).catch(function(e){alert("Request failed: "+e.message);btn.disabled=false;btn.textContent="\u21bb Refresh Existing URL";});}function copyRefUrl(){if(!rurl2)return;navigator.clipboard.writeText(rurl2).then(function(){var b=document.getElementById("refResult").querySelector(".copy");b.textContent="Copied!";setTimeout(function(){b.textContent="\u29c3 Copy URL";},1500);});}document.getElementById("clientId").addEventListener("keydown",function(e){if(e.key==="Enter")generate();});<\/script></body></html>';
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -324,9 +412,6 @@ app.post('/refresh', async function(req, res) {
     entry.clientId = clientId;
     TOKEN_CACHE.set(token, entry);
     await redisSave(token, entry);
-    console.log('[TOKEN] Refreshed clientId: ' + token.slice(0, 8) + '...');
-  } else {
-    console.log('[TOKEN] Refreshed (no clientId change): ' + token.slice(0, 8) + '...');
   }
   var manifestUrl = getBaseUrl(req) + '/u/' + token + '/manifest.json';
   res.json({ token: token, manifestUrl: manifestUrl, refreshed: true });
@@ -336,14 +421,15 @@ app.get('/u/:token/manifest.json', tokenMiddleware, function(req, res) {
   res.json({
     id:          'com.eclipse.soundcloud.' + req.params.token.slice(0, 8),
     name:        'SoundCloud',
-    version:     '3.2.0',
-    description: 'SoundCloud search — tracks, albums, artists, and playlists with YouTube fallback.',
+    version:     '3.3.0',
+    description: 'SoundCloud + YouTube Music — tracks, albums, artists, playlists, and playlist import.',
     icon:        'https://a-v2.sndcdn.com/assets/images/sc-icons/ios-orange-2xhdpi-a9dce059.png',
     resources:   ['search', 'stream', 'catalog'],
     types:       ['track', 'album', 'artist', 'playlist']
   });
 });
 
+// ─── Search ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
   var q = cleanText(req.query.q || '');
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
@@ -422,13 +508,23 @@ app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
   }
 });
 
+// ─── Stream ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/stream/:id', tokenMiddleware, async function(req, res) {
-  var cid = effectiveClientId(req.tokenEntry);
+  var cid     = effectiveClientId(req.tokenEntry);
+  var trackId = req.params.id;
+
+  // ytm_ prefixed IDs come from YTM playlist imports — go straight to Piped
+  if (trackId.indexOf('ytm_') === 0) {
+    var videoId = trackId.replace('ytm_', '');
+    var ytStream = await youtubeStreamUrl(videoId);
+    if (ytStream) return res.json(ytStream);
+    return res.status(404).json({ error: 'Could not stream YTM track: ' + videoId });
+  }
+
   if (!cid) return res.status(503).json({ error: 'No client_id available. Retry in a few seconds.' });
 
-  var trackId = req.params.id;
-  var track   = null;
-  var cached  = TRACK_CACHE.get(String(trackId)) || null;
+  var track  = null;
+  var cached = TRACK_CACHE.get(String(trackId)) || null;
 
   try {
     try { track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/soundcloud:tracks:' + trackId); }
@@ -449,7 +545,6 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async function(req, res) {
         var streamData = await scGet(cid, chosen.url);
         if (streamData && streamData.url) {
           var isProg = chosen.format && chosen.format.protocol === 'progressive';
-          console.log('[/stream] SoundCloud OK (' + (isProg ? 'progressive' : 'hls') + ') track ' + trackId);
           return res.json({
             url:       streamData.url,
             format:    (chosen.format && chosen.format.mime_type && chosen.format.mime_type.indexOf('aac') !== -1) ? 'aac' : 'mp3',
@@ -465,7 +560,7 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async function(req, res) {
   if (!meta || !meta.title) return res.status(404).json({ error: 'No stream and no fallback metadata.' });
 
   var yt = await youtubeFallback(meta.title, meta.artist || meta.uploader || '');
-  if (yt) { console.log('[/stream] YouTube fallback OK for "' + meta.title + '"'); return res.json(yt); }
+  if (yt) return res.json(yt);
 
   return res.status(404).json({ error: 'No stream from SoundCloud or YouTube for: ' + (meta.artist ? meta.artist + ' - ' : '') + meta.title });
 });
@@ -572,8 +667,22 @@ app.get('/u/:token/playlist/:id', tokenMiddleware, async function(req, res) {
   var cid = effectiveClientId(req.tokenEntry);
   if (!cid) return res.status(503).json({ error: 'No client_id available.' });
 
+  var rawId = req.params.id;
+
+  // YTM playlist — id starts with ytm_
+  if (rawId.indexOf('ytm_') === 0) {
+    try {
+      var ytmId = rawId.replace('ytm_', '');
+      var ytmPlaylist = await importYtmPlaylist(ytmId);
+      return res.json(ytmPlaylist);
+    } catch (err) {
+      console.error('[/playlist ytm] ' + err.message);
+      return res.status(500).json({ error: 'YTM playlist fetch failed: ' + err.message });
+    }
+  }
+
   try {
-    var playlist = await scGet(cid, 'https://api-v2.soundcloud.com/playlists/' + req.params.id);
+    var playlist = await scGet(cid, 'https://api-v2.soundcloud.com/playlists/' + rawId);
     if (!playlist) return res.status(404).json({ error: 'Playlist not found.' });
 
     var resolved = await resolveStubTracks(cid, playlist.tracks || [], playlist.artwork_url);
@@ -604,9 +713,45 @@ app.get('/u/:token/playlist/:id', tokenMiddleware, async function(req, res) {
   }
 });
 
-app.get('/', function(req, res) {
-  res.send(buildConfigPage(getBaseUrl(req)));
+// ─── Import endpoint — accepts a SoundCloud or YTM playlist URL ───────────────
+// Eclipse calls this when a user pastes a playlist URL into Import Playlist.
+// Route: GET /u/:token/import?url={playlistUrl}
+app.get('/u/:token/import', tokenMiddleware, async function(req, res) {
+  var cid      = effectiveClientId(req.tokenEntry);
+  var inputUrl = cleanText(req.query.url || '');
+
+  if (!inputUrl) return res.status(400).json({ error: 'Pass ?url= with a SoundCloud or YouTube Music playlist URL.' });
+
+  var type = detectUrlType(inputUrl);
+  console.log('[/import] type=' + type + ' url=' + inputUrl);
+
+  if (type === 'sc_playlist') {
+    if (!cid) return res.status(503).json({ error: 'No SoundCloud client_id available yet.' });
+    try {
+      var scResult = await importScPlaylist(cid, inputUrl);
+      return res.json(scResult);
+    } catch (err) {
+      console.error('[/import sc] ' + err.message);
+      return res.status(500).json({ error: 'SoundCloud import failed: ' + err.message });
+    }
+  }
+
+  if (type === 'ytm_playlist') {
+    var ytmId = extractYtmPlaylistId(inputUrl);
+    if (!ytmId) return res.status(400).json({ error: 'Could not extract playlist ID from URL.' });
+    try {
+      var ytmResult = await importYtmPlaylist(ytmId);
+      return res.json(ytmResult);
+    } catch (err) {
+      console.error('[/import ytm] ' + err.message);
+      return res.status(500).json({ error: 'YouTube Music import failed: ' + err.message });
+    }
+  }
+
+  return res.status(400).json({ error: 'URL not recognised. Paste a soundcloud.com/*/sets/* or music.youtube.com playlist URL.' });
 });
+
+app.get('/', function(req, res) { res.send(buildConfigPage(getBaseUrl(req))); });
 
 app.post('/generate', async function(req, res) {
   var ip     = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
@@ -643,5 +788,5 @@ app.get('/health', function(_req, res) {
 });
 
 app.listen(PORT, function() {
-  console.log('Eclipse SoundCloud Addon on port ' + PORT);
+  console.log('Eclipse SoundCloud Addon v3.3.0 on port ' + PORT);
 });
