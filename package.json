@@ -1,6 +1,6 @@
 {
   "name": "soundcloud-eclipse-addon",
-  "version": "2.4.0",
+  "version": "3.0.0",
   "description": "SoundCloud addon with YouTube fallback and per-user tokens",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
