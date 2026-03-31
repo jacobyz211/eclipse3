@@ -191,11 +191,7 @@ async function resolveStubs(cid, tracks, fbArt) {
 }
 
 // ─── YouTube (replaces dead Piped) ────────────────────────────────────────
-var YTDL_OPTS = {
-  requestOptions: {
-    headers: { 'User-Agent': UA }
-  }
-};
+var YTDL_OPTS = { requestOptions: { headers: { 'User-Agent': UA } } };
 
 async function youtubeStreamUrl(videoId) {
   try {
@@ -217,7 +213,6 @@ async function youtubeStreamUrl(videoId) {
   }
 }
 
-// Innertube search - no external package needed
 async function youtubeSearchId(query) {
   try {
     var body = {
@@ -245,7 +240,7 @@ async function ytFallback(title, artist) {
   return null;
 }
 
-// ─── YTM playlist import (via ytpl) ───────────────────────────────────────
+// ─── YTM playlist import ──────────────────────────────────────────────────
 async function importYtmPlaylist(playlistId) {
   var cleanId = playlistId.replace(/^VL/, '');
   try {
@@ -363,7 +358,7 @@ function buildConfigPage(baseUrl) {
   h += '<h1>SoundCloud for Eclipse</h1>';
   h += '<div class="tip"><b>Save your URL</b> - copy it to Notes or a bookmark. If the server updates, paste it into the Refresh section below to keep all playlists working without generating a new link.</div>';
   h += '<p class="sub">Generate your personal addon URL. Independent rate limits and client ID per user.</p>';
-  h += '<div class="pills"><span class="pill">Tracks, albums, artists</span><span class="pill">SC playlists</span><span class="pill o">YouTube fallback</span><span class="pill b">YTM import</span></div>';
+  h += '<div class="pills"><span class="pill">Tracks, albums, artists</span><span class="pill">SC playlists</span><span class="pill o">YouTube fallback</span><span class="pill b">YTM import</span><span class="pill b">Offline download</span></div>';
 
   h += '<div class="lbl">SoundCloud Client ID <span style="color:#3a3a3a;font-weight:400;text-transform:none">(optional)</span></div>';
   h += '<input type="text" id="clientId" placeholder="Leave blank to use the shared auto-refreshed ID">';
@@ -386,7 +381,7 @@ function buildConfigPage(baseUrl) {
   h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap Install</div></div>';
   h += '<div class="step"><div class="sn">4</div><div class="st">Use the <b>Playlist Importer</b> below to download any SC or YTM playlist as CSV, then import in Eclipse via Library > Import > CSV</div></div>';
   h += '</div>';
-  h += '<div class="warn">Your URL is saved to Redis and survives server restarts. YouTube Music playlists must be set to Public to import.</div>';
+  h += '<div class="warn">Your URL is saved to Redis and survives server restarts. Do NOT reinstall the addon in Eclipse after server updates — you never need to. YouTube Music playlists must be Public to import.</div>';
   h += '</div>';
 
   h += '<div class="card">';
@@ -403,7 +398,7 @@ function buildConfigPage(baseUrl) {
   h += '<button class="bg" id="impBtn" onclick="doImport()">Fetch &amp; Download CSV</button>';
   h += '</div>';
 
-  h += '<footer>Eclipse SoundCloud Addon v3.5.0 &bull; <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
+  h += '<footer>Eclipse SoundCloud Addon v3.6.0 &bull; <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
 
   h += '<script>';
   h += 'var _gu="",_ru="";';
@@ -461,7 +456,6 @@ function buildConfigPage(baseUrl) {
   h += '}';
 
   h += 'function getTok(s){var m=s.match(/\\/u\\/([a-f0-9]{28})\\//);return m?m[1]:null;}';
-
   h += 'function hesc(s){return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}';
 
   h += 'function doImport(){';
@@ -553,8 +547,8 @@ app.post('/refresh', async function (req, res) {
 app.get('/u/:token/manifest.json', tokenMiddleware, function (req, res) {
   res.json({
     id: 'com.eclipse.soundcloud.' + req.params.token.slice(0, 8),
-    name: 'SoundCloud', version: '3.5.0',
-    description: 'SoundCloud + YouTube Music. Tracks, albums, artists, playlists, CSV import.',
+    name: 'SoundCloud', version: '3.6.0',
+    description: 'SoundCloud + YouTube Music. Tracks, albums, artists, playlists, CSV import, offline download.',
     icon: 'https://a-v2.sndcdn.com/assets/images/sc-icons/ios-orange-2xhdpi-a9dce059.png',
     resources: ['search', 'stream', 'catalog'],
     types: ['track', 'album', 'artist', 'playlist']
@@ -588,7 +582,7 @@ app.get('/u/:token/search', tokenMiddleware, async function (req, res) {
 app.get('/u/:token/stream/:id', tokenMiddleware, async function (req, res) {
   var cid = effectiveCid(req.tokenEntry), tid = req.params.id;
 
-  // YTM track — stream directly
+  // YTM track — stream directly via ytdl (always returns direct M4A, offline-safe)
   if (tid.indexOf('ytm_') === 0) {
     var ys = await youtubeStreamUrl(tid.replace('ytm_', ''));
     return ys ? res.json(ys) : res.status(404).json({ error: 'Could not stream YTM track.' });
@@ -596,7 +590,6 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async function (req, res) {
 
   if (!cid) return res.status(503).json({ error: 'No client_id available.' });
 
-  // Try SoundCloud first
   var track = null, cached = TRACK_CACHE.get(String(tid)) || null;
   try {
     try { track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/soundcloud:tracks:' + tid); }
@@ -605,22 +598,24 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async function (req, res) {
 
   if (track) { rememberTrack(track); cached = TRACK_CACHE.get(String(tid)) || cached; }
 
-  // Only stream from SC if not SNIP or BLOCK
+  // Try SoundCloud progressive stream (direct file = offline-downloadable)
+  // Skip HLS — Eclipse can play it but cannot save it offline
   if (track && track.policy !== 'BLOCK' && track.policy !== 'SNIP') {
     try {
       var tc = (track.media && track.media.transcodings) || [];
-      var ch = tc.find(function (t) { return t.format && t.format.protocol === 'progressive'; })
-            || tc.find(function (t) { return t.format && t.format.protocol === 'hls' && t.format.mime_type && t.format.mime_type.indexOf('aac') !== -1; })
-            || tc.find(function (t) { return t.format && t.format.protocol === 'hls'; })
-            || tc[0];
-      if (ch && ch.url) {
-        var sd = await scGet(cid, ch.url);
-        if (sd && sd.url) return res.json({ url: sd.url, format: (ch.format && ch.format.mime_type && ch.format.mime_type.indexOf('aac') !== -1) ? 'aac' : 'mp3', quality: '160kbps', expiresAt: Math.floor(Date.now() / 1000) + (ch.format && ch.format.protocol === 'progressive' ? 86400 : 3300) });
+      var progressive = tc.find(function (t) { return t.format && t.format.protocol === 'progressive'; });
+      if (progressive && progressive.url) {
+        var sd = await scGet(cid, progressive.url);
+        if (sd && sd.url) {
+          var fmt = (progressive.format && progressive.format.mime_type && progressive.format.mime_type.indexOf('aac') !== -1) ? 'aac' : 'mp3';
+          return res.json({ url: sd.url, format: fmt, quality: '160kbps', expiresAt: Math.floor(Date.now() / 1000) + 86400 });
+        }
       }
-    } catch (e) { console.warn('[stream] sc stream failed'); }
+      // No progressive available — fall through to YouTube for a direct M4A
+    } catch (e) { console.warn('[stream] sc progressive failed'); }
   }
 
-  // Fall back to YouTube
+  // YouTube fallback — always returns a direct M4A URL, works for offline download
   var meta = track ? parseArtistTitle(track) : cached;
   if (!meta || !meta.title) return res.status(404).json({ error: 'No stream and no fallback metadata.' });
   var yt = await ytFallback(meta.title, meta.artist || meta.uploader || '');
@@ -697,4 +692,4 @@ app.get('/health', function (_req, res) {
   res.json({ status: 'ok', sharedClientIdReady: !!SHARED_CLIENT_ID, redisConnected: !!(redis && redis.status === 'ready'), activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
 });
 
-app.listen(PORT, function () { console.log('Eclipse SoundCloud Addon v3.5.0 on port ' + PORT); });
+app.listen(PORT, function () { console.log('Eclipse SoundCloud Addon v3.6.0 on port ' + PORT); });
