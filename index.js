@@ -81,7 +81,7 @@ async function tokenMiddleware(req, res, next) {
   next();
 }
 
-function getBaseUrl(req) { return req.protocol + '://' + req.get('host'); }
+function getBaseUrl(req) { var proto = req.headers['x-forwarded-proto'] || req.protocol; return proto + '://' + req.get('host'); }
 function effectiveClientId(entry) { return (entry && entry.clientId) ? entry.clientId : SHARED_CLIENT_ID; }
 
 // ─── SoundCloud helpers ───────────────────────────────────────────────────────
