@@ -1,13 +1,14 @@
 {
   "name": "soundcloud-eclipse-addon",
-  "version": "2.1.0",
-  "description": "SoundCloud addon with YouTube fallback for Eclipse Music",
+  "version": "2.4.0",
+  "description": "SoundCloud addon with YouTube fallback and per-user tokens",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "dependencies": {
-    "axios": "^1.7.0",
-    "cors": "^2.8.5",
-    "express": "^4.19.0"
+    "axios":   "^1.7.0",
+    "cors":    "^2.8.5",
+    "express": "^4.19.0",
+    "ioredis": "^5.3.2"
   },
   "engines": { "node": ">=18.0.0" }
 }
