@@ -269,7 +269,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, function(req, res) {
   res.json({
     id:          'com.eclipse.soundcloud.' + req.params.token.slice(0, 8),
     name:        'SoundCloud',
-    version:     '2.4.0',
+    version:     '3.0.0',
     description: 'SoundCloud search with YouTube fallback.',
     icon:        'https://a-v2.sndcdn.com/assets/images/sc-icons/ios-orange-2xhdpi-a9dce059.png',
     resources:   ['search', 'stream'],
