@@ -256,6 +256,34 @@ function buildConfigPage(baseUrl) {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
+app.post('/refresh', async function(req, res) {
+  var raw      = (req.body && req.body.existingUrl) ? String(req.body.existingUrl).trim() : '';
+  var clientId = (req.body && req.body.clientId)    ? String(req.body.clientId).trim()    : null;
+
+  var token = raw;
+  var m = raw.match(/\/u\/([a-f0-9]{28})\//);
+  if (m) token = m[1];
+
+  if (!token || !/^[a-f0-9]{28}$/.test(token)) {
+    return res.status(400).json({ error: 'Paste your full addon URL (the one ending in /manifest.json).' });
+  }
+
+  var entry = await getTokenEntry(token);
+  if (!entry) return res.status(404).json({ error: 'URL not found — it may belong to a different server instance. Generate a new one.' });
+
+  if (clientId) {
+    if (!/^[a-zA-Z0-9]{20,40}$/.test(clientId)) {
+      return res.status(400).json({ error: 'Invalid client_id format (20-40 alphanumeric characters).' });
+    }
+    entry.clientId = clientId;
+    TOKEN_CACHE.set(token, entry);
+    await redisSave(token, entry);
+  }
+
+  var manifestUrl = getBaseUrl(req) + '/u/' + token + '/manifest.json';
+  res.json({ token: token, manifestUrl: manifestUrl, refreshed: true });
+});
+
 app.get('/', function(req, res) {
   res.setHeader('Content-Type', 'text/html');
   res.send(buildConfigPage(getBaseUrl(req)));
