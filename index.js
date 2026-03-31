@@ -3,13 +3,15 @@ const cors    = require('cors');
 const axios   = require('axios');
 const crypto  = require('crypto');
 const Redis   = require('ioredis');
+const ytdl    = require('@distube/ytdl-core');
+const ytpl    = require('ytpl');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Redis
+// ─── Redis ────────────────────────────────────────────────────────────────
 let redis = null;
 if (process.env.REDIS_URL) {
   redis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: 3, enableReadyCheck: false });
@@ -28,7 +30,7 @@ async function redisLoad(token) {
   catch (e) { return null; }
 }
 
-// Token store
+// ─── Token store ──────────────────────────────────────────────────────────
 const TOKEN_CACHE       = new Map();
 const IP_CREATES        = new Map();
 const MAX_TOKENS_PER_IP = 10;
@@ -72,7 +74,7 @@ async function tokenMiddleware(req, res, next) {
 function getBaseUrl(req) { return (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host'); }
 function effectiveCid(e) { return (e && e.clientId) ? e.clientId : SHARED_CLIENT_ID; }
 
-// SoundCloud client_id
+// ─── SoundCloud client_id ─────────────────────────────────────────────────
 var SHARED_CLIENT_ID = null;
 const TRACK_CACHE = new Map();
 const sleep = function (ms) { return new Promise(function (r) { return setTimeout(r, ms); }); };
@@ -93,7 +95,7 @@ function findId(text) {
 function cleanText(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
 
 function parseArtistTitle(track) {
-  var raw = cleanText(track && track.title);
+  var raw  = cleanText(track && track.title);
   var meta = cleanText((track && track.publisher_metadata && (track.publisher_metadata.artist || track.publisher_metadata.writer_composer)) || '');
   var up   = cleanText(track && track.user && track.user.username);
   if (raw.indexOf(' - ') !== -1) {
@@ -113,13 +115,18 @@ function artworkUrl(raw, fb) { var s = raw || fb || ''; return s ? s.replace('-l
 function scYear(x) { return (x.release_date || x.created_at || '').slice(0, 4) || null; }
 
 async function getHtml(url) {
-  try { var r = await axios.get(url, { headers: { 'User-Agent': UA, 'Accept': 'text/html', 'Accept-Encoding': 'gzip, deflate' }, timeout: 15000, decompress: true, responseType: 'text', validateStatus: function (s) { return s < 500; } }); return r.data || ''; }
-  catch (e) { return null; }
+  try {
+    var r = await axios.get(url, { headers: { 'User-Agent': UA, 'Accept': 'text/html', 'Accept-Encoding': 'gzip, deflate' }, timeout: 15000, decompress: true, responseType: 'text', validateStatus: function (s) { return s < 500; } });
+    return r.data || '';
+  } catch (e) { return null; }
 }
 
 async function getJs(url) {
-  try { var r = await axios.get(url, { headers: { 'User-Agent': UA, 'Accept': '*/*', 'Referer': 'https://soundcloud.com/' }, timeout: 12000, decompress: true, responseType: 'text', validateStatus: function (s) { return s < 500; } }); if (r.status !== 200 || (r.data || '').length < 5000) return null; return r.data; }
-  catch (e) { return null; }
+  try {
+    var r = await axios.get(url, { headers: { 'User-Agent': UA, 'Accept': '*/*', 'Referer': 'https://soundcloud.com/' }, timeout: 12000, decompress: true, responseType: 'text', validateStatus: function (s) { return s < 500; } });
+    if (r.status !== 200 || (r.data || '').length < 5000) return null;
+    return r.data;
+  } catch (e) { return null; }
 }
 
 async function tryExtract() {
@@ -183,48 +190,87 @@ async function resolveStubs(cid, tracks, fbArt) {
   return tracks.map(function (t) { return map[String(t.id)] || t; }).filter(function (t) { return !!t.title; });
 }
 
-// Piped
-var PIPED = ['https://pipedapi.kavin.rocks','https://piped-api.garudalinux.org','https://api.piped.projectsegfau.lt','https://pipedapi.in.projectsegfau.lt'];
-
-async function pipedGet(path, params) {
-  for (var i = 0; i < PIPED.length; i++) {
-    try { var r = await axios.get(PIPED[i] + path, { params: params || {}, headers: { 'User-Agent': UA }, timeout: 10000 }); if (r.data) return r.data; }
-    catch (e) {}
+// ─── YouTube (replaces dead Piped) ────────────────────────────────────────
+var YTDL_OPTS = {
+  requestOptions: {
+    headers: { 'User-Agent': UA }
   }
-  return null;
-}
-
-function extractVid(item) { var m = String(item.url || '').match(/(?:v=|\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/); return m ? m[1] : null; }
+};
 
 async function youtubeStreamUrl(videoId) {
-  var data = await pipedGet('/streams/' + videoId);
-  if (!data || !Array.isArray(data.audioStreams) || !data.audioStreams.length) return null;
-  var direct = data.audioStreams.filter(function (s) { return s && s.url && /^https?:\/\//i.test(s.url); });
-  var chosen = direct.find(function (s) { return (s.mimeType || '').indexOf('audio/mp4') !== -1; })
-            || direct.find(function (s) { return String(s.format || '').toUpperCase() === 'M4A'; })
-            || direct.sort(function (a, b) { return (b.bitrate || 0) - (a.bitrate || 0); })[0];
-  if (!chosen || !chosen.url) return null;
-  return { url: chosen.url, format: 'm4a', quality: Math.round((chosen.bitrate || 128000) / 1000) + 'kbps', expiresAt: Math.floor(Date.now() / 1000) + 21600 };
+  try {
+    var info = await ytdl.getInfo('https://www.youtube.com/watch?v=' + videoId, YTDL_OPTS);
+    var formats = ytdl.filterFormats(info.formats, 'audioonly');
+    if (!formats.length) return null;
+    var chosen = formats.find(function (f) { return f.container === 'mp4' || f.container === 'm4a'; })
+              || formats.sort(function (a, b) { return (b.audioBitrate || 0) - (a.audioBitrate || 0); })[0];
+    if (!chosen || !chosen.url) return null;
+    return {
+      url:       chosen.url,
+      format:    (chosen.container === 'mp4' || chosen.container === 'm4a') ? 'm4a' : 'mp3',
+      quality:   (chosen.audioBitrate || 128) + 'kbps',
+      expiresAt: Math.floor(Date.now() / 1000) + 21600
+    };
+  } catch (e) {
+    console.warn('[YT stream] ' + videoId + ': ' + e.message);
+    return null;
+  }
+}
+
+// Innertube search - no external package needed
+async function youtubeSearchId(query) {
+  try {
+    var body = {
+      context: { client: { clientName: 'WEB', clientVersion: '2.20240101.00.00', hl: 'en', gl: 'US' } },
+      query: query,
+      params: 'EgIQAQ=='
+    };
+    var res = await axios.post('https://www.youtube.com/youtubei/v1/search', body, {
+      headers: { 'Content-Type': 'application/json', 'User-Agent': UA, 'X-YouTube-Client-Name': '1', 'X-YouTube-Client-Version': '2.20240101.00.00' },
+      timeout: 10000
+    });
+    var matches = JSON.stringify(res.data).match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
+    return matches ? matches[1] : null;
+  } catch (e) {
+    console.warn('[YT search] ' + e.message);
+    return null;
+  }
 }
 
 async function ytFallback(title, artist) {
-  var q = (artist ? artist + ' - ' : '') + title;
-  for (var query of [q, title]) {
-    var data = await pipedGet('/search', { q: query, filter: 'music_songs' });
-    if (!data || !Array.isArray(data.items) || !data.items.length) data = await pipedGet('/search', { q: query, filter: 'all' });
-    var items = (data && data.items || []).filter(function (x) { return extractVid(x); });
-    if (items.length) { var s = await youtubeStreamUrl(extractVid(items[0])); if (s) return s; }
+  for (var q of [(artist ? artist + ' - ' : '') + title, title]) {
+    var videoId = await youtubeSearchId(q);
+    if (videoId) { var s = await youtubeStreamUrl(videoId); if (s) return s; }
   }
   return null;
 }
 
-function detectUrlType(url) {
-  if (!url) return null;
-  if (/soundcloud\.com\/.+\/sets\/.+/.test(url)) return 'sc_playlist';
-  if (/(?:music\.youtube\.com|youtube\.com).*[?&]list=/.test(url)) return 'ytm_playlist';
-  return null;
+// ─── YTM playlist import (via ytpl) ───────────────────────────────────────
+async function importYtmPlaylist(playlistId) {
+  var cleanId = playlistId.replace(/^VL/, '');
+  try {
+    var pl = await ytpl(cleanId, { limit: Infinity });
+    return {
+      id:         'ytm_' + cleanId,
+      title:      pl.title || 'YouTube Music Playlist',
+      artworkURL: (pl.bestThumbnail && pl.bestThumbnail.url) || null,
+      creator:    (pl.author && pl.author.name) || 'YouTube Music',
+      tracks:     (pl.items || []).map(function (item) {
+        return {
+          id:         'ytm_' + item.id,
+          title:      item.title || 'Unknown',
+          artist:     (item.author && item.author.name) || 'Unknown',
+          duration:   item.durationSec || null,
+          artworkURL: (item.bestThumbnail && item.bestThumbnail.url) || null
+        };
+      })
+    };
+  } catch (e) {
+    throw new Error('Could not fetch YouTube playlist: ' + e.message + '. Make sure the playlist is Public (not Unlisted or Private).');
+  }
 }
 
+// ─── SC playlist import ───────────────────────────────────────────────────
 async function importScPlaylist(cid, scUrl) {
   var res = await scGet(cid, 'https://api-v2.soundcloud.com/resolve', { url: scUrl });
   if (!res) throw new Error('Could not resolve SoundCloud URL');
@@ -240,20 +286,23 @@ async function importScPlaylist(cid, scUrl) {
   };
 }
 
-async function importYtmPlaylist(plId) {
-  var data = await pipedGet('/playlists/' + plId);
-  if (!data) throw new Error('Could not fetch YTM playlist');
-  return {
-    id: 'ytm_' + plId, title: cleanText(data.name || 'YouTube Music Playlist'),
-    artworkURL: data.thumbnailUrl || null, creator: cleanText(data.uploader || 'YouTube Music'),
-    tracks: (Array.isArray(data.relatedStreams) ? data.relatedStreams : [])
-      .filter(function (x) { return x && x.title; })
-      .map(function (x) { var v = extractVid(x); return { id: 'ytm_' + (v || ''), title: cleanText(x.title), artist: cleanText(x.uploaderName || x.uploader || 'Unknown'), duration: x.duration || null, artworkURL: x.thumbnail || null }; })
-      .filter(function (t) { return t.id && t.title; })
-  };
+// ─── URL helpers ──────────────────────────────────────────────────────────
+function detectUrlType(url) {
+  if (!url) return null;
+  if (/soundcloud\.com\/.+\/sets\/.+/.test(url)) return 'sc_playlist';
+  if (/(?:music\.youtube\.com|youtube\.com).*[?&]list=/.test(url)) return 'ytm_playlist';
+  if (/music\.youtube\.com\/browse\/VL/.test(url)) return 'ytm_playlist';
+  return null;
 }
 
-// Config page - built via string concat to avoid template literal issues
+function extractYtmId(url) {
+  var browse = url.match(/\/browse\/VL([a-zA-Z0-9_-]+)/);
+  if (browse) return browse[1];
+  var m = url.match(/[?&]list=([a-zA-Z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+// ─── Config page ──────────────────────────────────────────────────────────
 function buildConfigPage(baseUrl) {
   var h = '';
   h += '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">';
@@ -301,7 +350,6 @@ function buildConfigPage(baseUrl) {
   h += 'footer{margin-top:32px;font-size:12px;color:#333;text-align:center;line-height:1.8}';
   h += '</style></head><body>';
 
-  // Logo
   h += '<svg class="logo" width="52" height="52" viewBox="0 0 52 52" fill="none">';
   h += '<circle cx="26" cy="26" r="26" fill="#f50"/>';
   h += '<path d="M15 30c0-2.4 2-4.4 4.4-4.4s4.4 2 4.4 4.4" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>';
@@ -311,7 +359,6 @@ function buildConfigPage(baseUrl) {
   h += '<rect x="41" y="23" width="3.5" height="15" rx="1.75" fill="#fff"/>';
   h += '</svg>';
 
-  // Main card
   h += '<div class="card">';
   h += '<h1>SoundCloud for Eclipse</h1>';
   h += '<div class="tip"><b>Save your URL</b> - copy it to Notes or a bookmark. If the server updates, paste it into the Refresh section below to keep all playlists working without generating a new link.</div>';
@@ -320,7 +367,7 @@ function buildConfigPage(baseUrl) {
 
   h += '<div class="lbl">SoundCloud Client ID <span style="color:#3a3a3a;font-weight:400;text-transform:none">(optional)</span></div>';
   h += '<input type="text" id="clientId" placeholder="Leave blank to use the shared auto-refreshed ID">';
-  h += '<div class="hint">Want your own? Open <a href="https://soundcloud.com" target="_blank">soundcloud.com</a>, press F12 - Network - filter <code>api-v2</code> - copy the <code>client_id=</code> value.</div>';
+  h += '<div class="hint">Want your own? Open <a href="https://soundcloud.com" target="_blank">soundcloud.com</a>, press F12 > Network > filter <code>api-v2</code> > copy the <code>client_id=</code> value.</div>';
 
   h += '<button class="bo" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
   h += '<div class="box" id="genBox"><div class="blbl">Your addon URL - paste this into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button></div>';
@@ -335,38 +382,36 @@ function buildConfigPage(baseUrl) {
   h += '<hr>';
   h += '<div class="steps">';
   h += '<div class="step"><div class="sn">1</div><div class="st">Generate and copy your URL above</div></div>';
-  h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> - Settings - Connections - Add Connection - Addon</div></div>';
+  h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> > Settings > Connections > Add Connection > Addon</div></div>';
   h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap Install</div></div>';
-  h += '<div class="step"><div class="sn">4</div><div class="st">Use the <b>Playlist Importer</b> below to download any SC or YTM playlist as a CSV, then import it in Eclipse via Library - Import - CSV</div></div>';
+  h += '<div class="step"><div class="sn">4</div><div class="st">Use the <b>Playlist Importer</b> below to download any SC or YTM playlist as CSV, then import in Eclipse via Library > Import > CSV</div></div>';
   h += '</div>';
-  h += '<div class="warn">Your URL is saved to Redis and survives server restarts.</div>';
+  h += '<div class="warn">Your URL is saved to Redis and survives server restarts. YouTube Music playlists must be set to Public to import.</div>';
   h += '</div>';
 
-  // Importer card
   h += '<div class="card">';
   h += '<span class="badge">Playlist Importer</span>';
   h += '<h2>Import SoundCloud or YouTube Music Playlist</h2>';
-  h += '<p class="sub">Paste your addon URL and a playlist link below. We will fetch all tracks and download a CSV you can import in Eclipse via Library - Import - CSV.</p>';
+  h += '<p class="sub">Paste your addon URL and a playlist link. We fetch all tracks and download a CSV you can import in Eclipse via Library > Import > CSV.</p>';
   h += '<div class="lbl">Your Addon URL</div>';
   h += '<input type="text" id="impToken" placeholder="Paste your addon URL here (auto-fills after generating)">';
   h += '<div class="lbl">Playlist URL</div>';
   h += '<input type="text" id="impUrl" placeholder="soundcloud.com/artist/sets/name  or  music.youtube.com/playlist?list=PL...">';
-  h += '<div class="hint">Supports: soundcloud.com/*/sets/* and music.youtube.com/playlist?list=...</div>';
+  h += '<div class="hint">SoundCloud: soundcloud.com/*/sets/* &nbsp;|&nbsp; YouTube Music: music.youtube.com/playlist?list=... or music.youtube.com/browse/VL...</div>';
   h += '<div class="status" id="impStatus"></div>';
   h += '<div class="preview" id="impPreview"></div>';
   h += '<button class="bg" id="impBtn" onclick="doImport()">Fetch &amp; Download CSV</button>';
   h += '</div>';
 
-  h += '<footer>Eclipse SoundCloud Addon v3.4.1 &bull; <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
+  h += '<footer>Eclipse SoundCloud Addon v3.5.0 &bull; <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
 
-  // All JS in one block, no template literals, no special characters
   h += '<script>';
   h += 'var _gu="",_ru="";';
 
   h += 'function generate(){';
   h += '  var btn=document.getElementById("genBtn");';
   h += '  var cid=document.getElementById("clientId").value.trim();';
-  h += '  btn.disabled=true; btn.textContent="Generating...";';
+  h += '  btn.disabled=true;btn.textContent="Generating...";';
   h += '  fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({clientId:cid||null})})';
   h += '  .then(function(r){return r.json();})';
   h += '  .then(function(d){';
@@ -375,7 +420,7 @@ function buildConfigPage(baseUrl) {
   h += '    document.getElementById("genUrl").textContent=_gu;';
   h += '    document.getElementById("genBox").style.display="block";';
   h += '    document.getElementById("impToken").value=_gu;';
-  h += '    btn.disabled=false; btn.textContent="Regenerate URL";';
+  h += '    btn.disabled=false;btn.textContent="Regenerate URL";';
   h += '  })';
   h += '  .catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});';
   h += '}';
@@ -383,8 +428,7 @@ function buildConfigPage(baseUrl) {
   h += 'function copyGen(){';
   h += '  if(!_gu)return;';
   h += '  navigator.clipboard.writeText(_gu).then(function(){';
-  h += '    var b=document.getElementById("copyGenBtn");';
-  h += '    b.textContent="Copied!";';
+  h += '    var b=document.getElementById("copyGenBtn");b.textContent="Copied!";';
   h += '    setTimeout(function(){b.textContent="Copy URL";},1500);';
   h += '  });';
   h += '}';
@@ -394,7 +438,7 @@ function buildConfigPage(baseUrl) {
   h += '  var eu=document.getElementById("existingUrl").value.trim();';
   h += '  var cid=document.getElementById("clientId").value.trim();';
   h += '  if(!eu){alert("Paste your existing addon URL first.");return;}';
-  h += '  btn.disabled=true; btn.textContent="Refreshing...";';
+  h += '  btn.disabled=true;btn.textContent="Refreshing...";';
   h += '  fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu,clientId:cid||null})})';
   h += '  .then(function(r){return r.json();})';
   h += '  .then(function(d){';
@@ -403,7 +447,7 @@ function buildConfigPage(baseUrl) {
   h += '    document.getElementById("refUrl").textContent=_ru;';
   h += '    document.getElementById("refBox").style.display="block";';
   h += '    document.getElementById("impToken").value=_ru;';
-  h += '    btn.disabled=false; btn.textContent="Refresh Again";';
+  h += '    btn.disabled=false;btn.textContent="Refresh Again";';
   h += '  })';
   h += '  .catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Refresh Existing URL";});';
   h += '}';
@@ -411,8 +455,7 @@ function buildConfigPage(baseUrl) {
   h += 'function copyRef(){';
   h += '  if(!_ru)return;';
   h += '  navigator.clipboard.writeText(_ru).then(function(){';
-  h += '    var b=document.getElementById("copyRefBtn");';
-  h += '    b.textContent="Copied!";';
+  h += '    var b=document.getElementById("copyRefBtn");b.textContent="Copied!";';
   h += '    setTimeout(function(){b.textContent="Copy URL";},1500);';
   h += '  });';
   h += '}';
@@ -430,9 +473,9 @@ function buildConfigPage(baseUrl) {
   h += '  if(!raw){st.className="status err";st.textContent="Paste your addon URL first.";return;}';
   h += '  if(!purl){st.className="status err";st.textContent="Paste a playlist URL.";return;}';
   h += '  var tok=getTok(raw);';
-  h += '  if(!tok){st.className="status err";st.textContent="Could not find your token. Paste the full addon URL.";return;}';
-  h += '  btn.disabled=true; btn.textContent="Fetching...";';
-  h += '  st.className="status"; st.textContent="Fetching tracks...";';
+  h += '  if(!tok){st.className="status err";st.textContent="Could not find your token in the URL.";return;}';
+  h += '  btn.disabled=true;btn.textContent="Fetching...";';
+  h += '  st.className="status";st.textContent="Fetching tracks...";';
   h += '  pv.style.display="none";';
   h += '  fetch("/u/"+tok+"/import?url="+encodeURIComponent(purl))';
   h += '  .then(function(r){';
@@ -446,7 +489,7 @@ function buildConfigPage(baseUrl) {
   h += '      return \'<div class="tr"><span class="tn">\'+(i+1)+\'</span><div class="ti"><div class="tt">\'+hesc(t.title)+\'</div><div class="ta">\'+hesc(t.artist)+\'</div></div></div>\';';
   h += '    }).join("");';
   h += '    if(tracks.length>50)rows+=\'<div class="tr" style="text-align:center;color:#555">+\'+(tracks.length-50)+\' more</div>\';';
-  h += '    pv.innerHTML=rows; pv.style.display="block";';
+  h += '    pv.innerHTML=rows;pv.style.display="block";';
   h += '    st.className="status ok";';
   h += '    st.textContent="Found "+tracks.length+" tracks in \\""+data.title+"\\"";';
   h += '    var lines=["Title,Artist,Album,Duration"];';
@@ -458,12 +501,12 @@ function buildConfigPage(baseUrl) {
   h += '    var a=document.createElement("a");';
   h += '    a.href=URL.createObjectURL(blob);';
   h += '    a.download=(data.title||"playlist").replace(/[^a-zA-Z0-9 _-]/g,"").trim()+".csv";';
-  h += '    document.body.appendChild(a); a.click(); document.body.removeChild(a);';
-  h += '    btn.disabled=false; btn.textContent="Fetch & Download CSV";';
+  h += '    document.body.appendChild(a);a.click();document.body.removeChild(a);';
+  h += '    btn.disabled=false;btn.textContent="Fetch & Download CSV";';
   h += '  })';
   h += '  .catch(function(e){';
-  h += '    st.className="status err"; st.textContent=e.message;';
-  h += '    btn.disabled=false; btn.textContent="Fetch & Download CSV";';
+  h += '    st.className="status err";st.textContent=e.message;';
+  h += '    btn.disabled=false;btn.textContent="Fetch & Download CSV";';
   h += '  });';
   h += '}';
 
@@ -472,7 +515,7 @@ function buildConfigPage(baseUrl) {
   return h;
 }
 
-// Routes
+// ─── Routes ───────────────────────────────────────────────────────────────
 app.get('/', function (req, res) {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(buildConfigPage(getBaseUrl(req)));
@@ -493,19 +536,29 @@ app.post('/generate', async function (req, res) {
 });
 
 app.post('/refresh', async function (req, res) {
-  var raw = (req.body && req.body.existingUrl) ? String(req.body.existingUrl).trim() : '';
-  var cid = (req.body && req.body.clientId) ? String(req.body.clientId).trim() : null;
+  var raw   = (req.body && req.body.existingUrl) ? String(req.body.existingUrl).trim() : '';
+  var cid   = (req.body && req.body.clientId)    ? String(req.body.clientId).trim()    : null;
   var token = raw, m = raw.match(/\/u\/([a-f0-9]{28})\//);
   if (m) token = m[1];
   if (!token || !/^[a-f0-9]{28}$/.test(token)) return res.status(400).json({ error: 'Paste your full addon URL.' });
   var entry = await getTokenEntry(token);
   if (!entry) return res.status(404).json({ error: 'URL not found. Generate a new one.' });
-  if (cid) { if (!/^[a-zA-Z0-9]{20,40}$/.test(cid)) return res.status(400).json({ error: 'Invalid client_id.' }); entry.clientId = cid; TOKEN_CACHE.set(token, entry); await redisSave(token, entry); }
+  if (cid) {
+    if (!/^[a-zA-Z0-9]{20,40}$/.test(cid)) return res.status(400).json({ error: 'Invalid client_id.' });
+    entry.clientId = cid; TOKEN_CACHE.set(token, entry); await redisSave(token, entry);
+  }
   res.json({ token: token, manifestUrl: getBaseUrl(req) + '/u/' + token + '/manifest.json', refreshed: true });
 });
 
 app.get('/u/:token/manifest.json', tokenMiddleware, function (req, res) {
-  res.json({ id: 'com.eclipse.soundcloud.' + req.params.token.slice(0, 8), name: 'SoundCloud', version: '3.4.1', description: 'SoundCloud + YouTube Music fallback. Tracks, albums, artists, playlists, CSV import.', icon: 'https://a-v2.sndcdn.com/assets/images/sc-icons/ios-orange-2xhdpi-a9dce059.png', resources: ['search', 'stream', 'catalog'], types: ['track', 'album', 'artist', 'playlist'] });
+  res.json({
+    id: 'com.eclipse.soundcloud.' + req.params.token.slice(0, 8),
+    name: 'SoundCloud', version: '3.5.0',
+    description: 'SoundCloud + YouTube Music. Tracks, albums, artists, playlists, CSV import.',
+    icon: 'https://a-v2.sndcdn.com/assets/images/sc-icons/ios-orange-2xhdpi-a9dce059.png',
+    resources: ['search', 'stream', 'catalog'],
+    types: ['track', 'album', 'artist', 'playlist']
+  });
 });
 
 app.get('/u/:token/search', tokenMiddleware, async function (req, res) {
@@ -525,27 +578,49 @@ app.get('/u/:token/search', tokenMiddleware, async function (req, res) {
         rememberTrack(t); var m = parseArtistTitle(t);
         return { id: String(t.id), title: m.title || 'Unknown', artist: m.artist || 'Unknown', album: null, duration: t.duration ? Math.floor(t.duration / 1000) : null, artworkURL: artworkUrl(t.artwork_url), format: 'aac', isSnipped: t.policy === 'SNIP' };
       }),
-      albums: allPl.filter(function (p) { return p.is_album === true; }).map(function (p) { return { id: String(p.id), title: p.title || 'Unknown', artist: (p.user && p.user.username) || 'Unknown', artworkURL: artworkUrl(p.artwork_url), trackCount: p.track_count || null, year: scYear(p) }; }),
+      albums:    allPl.filter(function (p) { return  p.is_album; }).map(function (p) { return { id: String(p.id), title: p.title || 'Unknown', artist: (p.user && p.user.username) || 'Unknown', artworkURL: artworkUrl(p.artwork_url), trackCount: p.track_count || null, year: scYear(p) }; }),
       playlists: allPl.filter(function (p) { return !p.is_album; }).map(function (p) { return { id: String(p.id), title: p.title || 'Unknown', description: p.description || null, artworkURL: artworkUrl(p.artwork_url), creator: (p.user && p.user.username) || null, trackCount: p.track_count || null }; }),
-      artists: ((results[2] && results[2].collection) || []).map(function (u) { return { id: String(u.id), name: u.username || 'Unknown', artworkURL: artworkUrl(u.avatar_url), genres: u.genre ? [u.genre] : [] }; })
+      artists:   ((results[2] && results[2].collection) || []).map(function (u) { return { id: String(u.id), name: u.username || 'Unknown', artworkURL: artworkUrl(u.avatar_url), genres: u.genre ? [u.genre] : [] }; })
     });
   } catch (e) { res.status(500).json({ error: 'Search failed', tracks: [] }); }
 });
 
 app.get('/u/:token/stream/:id', tokenMiddleware, async function (req, res) {
   var cid = effectiveCid(req.tokenEntry), tid = req.params.id;
-  if (tid.indexOf('ytm_') === 0) { var ys = await youtubeStreamUrl(tid.replace('ytm_', '')); return ys ? res.json(ys) : res.status(404).json({ error: 'Could not stream YTM track.' }); }
+
+  // YTM track — stream directly
+  if (tid.indexOf('ytm_') === 0) {
+    var ys = await youtubeStreamUrl(tid.replace('ytm_', ''));
+    return ys ? res.json(ys) : res.status(404).json({ error: 'Could not stream YTM track.' });
+  }
+
   if (!cid) return res.status(503).json({ error: 'No client_id available.' });
+
+  // Try SoundCloud first
   var track = null, cached = TRACK_CACHE.get(String(tid)) || null;
-  try { try { track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/soundcloud:tracks:' + tid); } catch (e) { track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/' + tid); } } catch (e) { console.warn('[stream] track lookup failed'); }
+  try {
+    try { track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/soundcloud:tracks:' + tid); }
+    catch (e) { track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/' + tid); }
+  } catch (e) { console.warn('[stream] track lookup failed'); }
+
   if (track) { rememberTrack(track); cached = TRACK_CACHE.get(String(tid)) || cached; }
+
+  // Only stream from SC if not SNIP or BLOCK
   if (track && track.policy !== 'BLOCK' && track.policy !== 'SNIP') {
     try {
       var tc = (track.media && track.media.transcodings) || [];
-      var ch = tc.find(function (t) { return t.format && t.format.protocol === 'progressive'; }) || tc.find(function (t) { return t.format && t.format.protocol === 'hls' && t.format.mime_type && t.format.mime_type.indexOf('aac') !== -1; }) || tc.find(function (t) { return t.format && t.format.protocol === 'hls'; }) || tc[0];
-      if (ch && ch.url) { var sd = await scGet(cid, ch.url); if (sd && sd.url) return res.json({ url: sd.url, format: (ch.format && ch.format.mime_type && ch.format.mime_type.indexOf('aac') !== -1) ? 'aac' : 'mp3', quality: '160kbps', expiresAt: Math.floor(Date.now() / 1000) + (ch.format && ch.format.protocol === 'progressive' ? 86400 : 3300) }); }
+      var ch = tc.find(function (t) { return t.format && t.format.protocol === 'progressive'; })
+            || tc.find(function (t) { return t.format && t.format.protocol === 'hls' && t.format.mime_type && t.format.mime_type.indexOf('aac') !== -1; })
+            || tc.find(function (t) { return t.format && t.format.protocol === 'hls'; })
+            || tc[0];
+      if (ch && ch.url) {
+        var sd = await scGet(cid, ch.url);
+        if (sd && sd.url) return res.json({ url: sd.url, format: (ch.format && ch.format.mime_type && ch.format.mime_type.indexOf('aac') !== -1) ? 'aac' : 'mp3', quality: '160kbps', expiresAt: Math.floor(Date.now() / 1000) + (ch.format && ch.format.protocol === 'progressive' ? 86400 : 3300) });
+      }
     } catch (e) { console.warn('[stream] sc stream failed'); }
   }
+
+  // Fall back to YouTube
   var meta = track ? parseArtistTitle(track) : cached;
   if (!meta || !meta.title) return res.status(404).json({ error: 'No stream and no fallback metadata.' });
   var yt = await ytFallback(meta.title, meta.artist || meta.uploader || '');
@@ -564,7 +639,6 @@ app.get('/u/:token/album/:id', tokenMiddleware, async function (req, res) {
   } catch (e) { res.status(500).json({ error: 'Album fetch failed.' }); }
 });
 
-// FIXED: use /playlists and filter is_album - /albums endpoint does not exist on SC v2 API
 app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
   var cid = effectiveCid(req.tokenEntry);
   if (!cid) return res.status(503).json({ error: 'No client_id.' });
@@ -588,7 +662,10 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
 
 app.get('/u/:token/playlist/:id', tokenMiddleware, async function (req, res) {
   var cid = effectiveCid(req.tokenEntry), rawId = req.params.id;
-  if (rawId.indexOf('ytm_') === 0) { try { return res.json(await importYtmPlaylist(rawId.replace('ytm_', ''))); } catch (e) { return res.status(500).json({ error: 'YTM playlist failed: ' + e.message }); } }
+  if (rawId.indexOf('ytm_') === 0) {
+    try { return res.json(await importYtmPlaylist(rawId.replace('ytm_', ''))); }
+    catch (e) { return res.status(500).json({ error: 'YTM playlist failed: ' + e.message }); }
+  }
   if (!cid) return res.status(503).json({ error: 'No client_id.' });
   try {
     var pl = await scGet(cid, 'https://api-v2.soundcloud.com/playlists/' + rawId);
@@ -604,12 +681,14 @@ app.get('/u/:token/import', tokenMiddleware, async function (req, res) {
   var type = detectUrlType(inputUrl);
   if (type === 'sc_playlist') {
     if (!cid) return res.status(503).json({ error: 'No SoundCloud client_id yet.' });
-    try { return res.json(await importScPlaylist(cid, inputUrl)); } catch (e) { return res.status(500).json({ error: 'SoundCloud import failed: ' + e.message }); }
+    try { return res.json(await importScPlaylist(cid, inputUrl)); }
+    catch (e) { return res.status(500).json({ error: 'SoundCloud import failed: ' + e.message }); }
   }
   if (type === 'ytm_playlist') {
-    var ytmId = (inputUrl.match(/[?&]list=([a-zA-Z0-9_-]+)/) || [])[1];
-    if (!ytmId) return res.status(400).json({ error: 'Could not extract playlist ID.' });
-    try { return res.json(await importYtmPlaylist(ytmId)); } catch (e) { return res.status(500).json({ error: 'YTM import failed: ' + e.message }); }
+    var ytmId = extractYtmId(inputUrl);
+    if (!ytmId) return res.status(400).json({ error: 'Could not extract playlist ID from URL.' });
+    try { return res.json(await importYtmPlaylist(ytmId)); }
+    catch (e) { return res.status(500).json({ error: e.message }); }
   }
   return res.status(400).json({ error: 'URL not recognised. Use soundcloud.com/*/sets/* or music.youtube.com/playlist?list=...' });
 });
@@ -618,4 +697,4 @@ app.get('/health', function (_req, res) {
   res.json({ status: 'ok', sharedClientIdReady: !!SHARED_CLIENT_ID, redisConnected: !!(redis && redis.status === 'ready'), activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
 });
 
-app.listen(PORT, function () { console.log('Eclipse SoundCloud Addon v3.4.1 on port ' + PORT); });
+app.listen(PORT, function () { console.log('Eclipse SoundCloud Addon v3.5.0 on port ' + PORT); });
