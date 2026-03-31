@@ -307,7 +307,7 @@ app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
     var data   = await scGet(cid, 'https://api-v2.soundcloud.com/search/tracks', { q: q, limit: 20, offset: 0, linked_partitioning: 1 });
     var tracks = (data.collection || []).filter(function(t) { return t.streamable !== false; }).map(function(t) {
       rememberTrack(t); var meta = parseArtistTitle(t);
-      return { id: String(t.id), title: meta.title || 'Unknown Title', artist: meta.artist || 'Unknown Artist', album: null, duration: t.duration ? Math.floor(t.duration / 1000) : null, artworkURL: t.artwork_url ? t.artwork_url.replace('-large', '-t500x500') : null, format: 'aac' };
+      return { id: String(t.id), title: meta.title || 'Unknown Title', artist: meta.artist || 'Unknown Artist', album: null, duration: t.duration ? Math.floor(t.duration / 1000) : null, artworkURL: t.artwork_url ? t.artwork_url.replace('-large', '-t500x500') : null, format: 'aac', isSnipped: t.policy === 'SNIP' // };
     });
     res.json({ tracks: tracks });
   } catch (err) { console.error('[/search] ' + err.message); res.status(500).json({ error: 'Search failed', tracks: [] }); }
@@ -328,7 +328,7 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async function(req, res) {
 
   if (track) { rememberTrack(track); cached = TRACK_CACHE.get(String(trackId)) || cached; }
 
-  if (track && track.policy !== 'BLOCK') {
+  if (track && track.policy !== 'BLOCK' && track.policy !== 'SNIP') {
     try {
       var transcodings = (track.media && track.media.transcodings) || [];
       var chosen =
