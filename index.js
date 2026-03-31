@@ -110,10 +110,6 @@ function findId(text) {
 
 function cleanText(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
 
-function stripFeatures(s) {
-  return cleanText(String(s || '').replace(/\s*\\((feat|ft|featuring)[^)]+\\)/gi, '').replace(/\s*(feat|ft|featuring)\.?\s+[^-|/]+/gi, ''));
-}
-
 function parseArtistTitle(track) {
   var rawTitle   = cleanText(track && track.title);
   var metaArtist = cleanText((track && track.publisher_metadata && (track.publisher_metadata.artist || track.publisher_metadata.writer_composer)) || '');
@@ -146,15 +142,19 @@ function scYear(item) {
 async function getPage(url) {
   try {
     var res = await axios.get(url, { headers: PAGE_HEADERS, timeout: 15000, decompress: true, responseType: 'text', validateStatus: function(s) { return s < 500; } });
-    var html = res.data || ''; console.log('[SC] ' + url + ' => HTTP ' + res.status + ' | ' + html.length + ' bytes'); return html;
+    var html = res.data || '';
+    console.log('[SC] ' + url + ' => HTTP ' + res.status + ' | ' + html.length + ' bytes');
+    return html;
   } catch (err) { console.warn('[SC] Page failed: ' + err.message); return null; }
 }
 
 async function getScript(url) {
   try {
     var res = await axios.get(url, { headers: { 'User-Agent': PAGE_HEADERS['User-Agent'], 'Accept': '*/*', 'Accept-Encoding': 'gzip, deflate', 'Referer': 'https://soundcloud.com/' }, timeout: 12000, decompress: true, responseType: 'text', validateStatus: function(s) { return s < 500; } });
-    var text = res.data || ''; console.log('[SC] Script ' + url.split('/').pop() + ' => ' + res.status + ' | ' + text.length + ' bytes');
-    if (res.status !== 200 || text.length < 5000) return null; return text;
+    var text = res.data || '';
+    console.log('[SC] Script ' + url.split('/').pop() + ' => ' + res.status + ' | ' + text.length + ' bytes');
+    if (res.status !== 200 || text.length < 5000) return null;
+    return text;
   } catch (err) { console.warn('[SC] Script failed: ' + err.message); return null; }
 }
 
@@ -180,8 +180,18 @@ async function fetchSharedClientId() {
   var delays = [5000, 10000, 15000, 30000, 60000]; var attempt = 0; var id, delay;
   while (true) {
     attempt++; console.log('[Attempt ' + attempt + '] Fetching shared client_id...');
-    try { id = await tryExtract(); if (!id) throw new Error('Not found'); SHARED_CLIENT_ID = id; console.log('Shared client_id: ' + id); setTimeout(function() { SHARED_CLIENT_ID = null; fetchSharedClientId(); }, 6 * 60 * 60 * 1000); return; }
-    catch (err) { delay = delays[Math.min(attempt - 1, delays.length - 1)]; console.warn('Attempt ' + attempt + ' failed. Retry in ' + (delay / 1000) + 's'); await sleep(delay); }
+    try {
+      id = await tryExtract();
+      if (!id) throw new Error('Not found');
+      SHARED_CLIENT_ID = id;
+      console.log('Shared client_id: ' + id);
+      setTimeout(function() { SHARED_CLIENT_ID = null; fetchSharedClientId(); }, 6 * 60 * 60 * 1000);
+      return;
+    } catch (err) {
+      delay = delays[Math.min(attempt - 1, delays.length - 1)];
+      console.warn('Attempt ' + attempt + ' failed. Retry in ' + (delay / 1000) + 's');
+      await sleep(delay);
+    }
   }
 }
 
@@ -195,26 +205,66 @@ async function scGet(clientId, url, params, retried) {
     return res.data;
   } catch (err) {
     if (!retried && err.response && (err.response.status === 401 || err.response.status === 403) && !params._userClientId) {
-      console.warn('[API] 401/403 on shared id - refreshing'); SHARED_CLIENT_ID = null; fetchSharedClientId(); await sleep(3000); return scGet(SHARED_CLIENT_ID, url, params, true);
+      console.warn('[API] 401/403 on shared id - refreshing');
+      SHARED_CLIENT_ID = null;
+      fetchSharedClientId();
+      await sleep(3000);
+      return scGet(SHARED_CLIENT_ID, url, params, true);
     }
     throw err;
   }
 }
 
+// ─── Resolve stub tracks ──────────────────────────────────────────────────────
+// SoundCloud returns placeholder objects with only an id and no title inside
+// playlists and albums. This fetches the full data for all stubs in batches.
+async function resolveStubTracks(cid, rawTracks, fallbackArtwork) {
+  var stubIds = rawTracks
+    .filter(function(t) { return !t.title; })
+    .map(function(t) { return t.id; });
+
+  var fullMap = {};
+
+  if (stubIds.length > 0) {
+    var batchSize = 50;
+    for (var i = 0; i < stubIds.length; i += batchSize) {
+      var batch = stubIds.slice(i, i + batchSize);
+      try {
+        var fetched = await scGet(cid, 'https://api-v2.soundcloud.com/tracks', { ids: batch.join(',') });
+        var arr = Array.isArray(fetched) ? fetched : ((fetched && fetched.collection) || []);
+        arr.forEach(function(t) { fullMap[String(t.id)] = t; });
+      } catch (e) { console.warn('[resolveStubs] Batch failed: ' + e.message); }
+    }
+  }
+
+  return rawTracks
+    .map(function(t) { return fullMap[String(t.id)] || t; })
+    .filter(function(t) { return !!t.title; });
+}
+
 // ─── YouTube / Piped ──────────────────────────────────────────────────────────
-var PIPED_INSTANCES = ['https://pipedapi.kavin.rocks','https://piped-api.garudalinux.org','https://api.piped.projectsegfau.lt','https://pipedapi.in.projectsegfau.lt'];
+var PIPED_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://piped-api.garudalinux.org',
+  'https://api.piped.projectsegfau.lt',
+  'https://pipedapi.in.projectsegfau.lt'
+];
 
 async function pipedGet(path, params) {
   params = params || {}; var i, res;
   for (i = 0; i < PIPED_INSTANCES.length; i++) {
-    try { res = await axios.get(PIPED_INSTANCES[i] + path, { params: params, headers: { 'User-Agent': PAGE_HEADERS['User-Agent'] }, timeout: 10000 }); if (res.data) return res.data; }
-    catch (err) { console.warn('[Piped] ' + PIPED_INSTANCES[i] + ' failed: ' + err.message); }
+    try {
+      res = await axios.get(PIPED_INSTANCES[i] + path, { params: params, headers: { 'User-Agent': PAGE_HEADERS['User-Agent'] }, timeout: 10000 });
+      if (res.data) return res.data;
+    } catch (err) { console.warn('[Piped] ' + PIPED_INSTANCES[i] + ' failed: ' + err.message); }
   }
   return null;
 }
 
 function extractYouTubeId(item) {
-  var url = String(item.url || item.videoUrl || ''); var m = url.match(/(?:v=|\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/); return m ? m[1] : null;
+  var url = String(item.url || item.videoUrl || '');
+  var m = url.match(/(?:v=|\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  return m ? m[1] : null;
 }
 
 async function youtubeSearch(query) {
@@ -226,21 +276,27 @@ async function youtubeSearch(query) {
 }
 
 async function youtubeStreamUrl(videoId) {
-  var data = await pipedGet('/streams/' + videoId); if (!data) return null;
-  var streams = Array.isArray(data.audioStreams) ? data.audioStreams : []; if (!streams.length) return null;
-  var direct  = streams.filter(function(s) { return s && s.url && /^https?:\/\//i.test(s.url); });
-  var chosen  = direct.find(function(s) { return (s.mimeType || '').indexOf('audio/mp4') !== -1; }) || direct.find(function(s) { return String(s.format || '').toUpperCase() === 'M4A'; }) || direct.sort(function(a, b) { return (b.bitrate || 0) - (a.bitrate || 0); })[0];
+  var data = await pipedGet('/streams/' + videoId);
+  if (!data) return null;
+  var streams = Array.isArray(data.audioStreams) ? data.audioStreams : [];
+  if (!streams.length) return null;
+  var direct = streams.filter(function(s) { return s && s.url && /^https?:\/\//i.test(s.url); });
+  var chosen =
+    direct.find(function(s) { return (s.mimeType || '').indexOf('audio/mp4') !== -1; }) ||
+    direct.find(function(s) { return String(s.format || '').toUpperCase() === 'M4A'; }) ||
+    direct.sort(function(a, b) { return (b.bitrate || 0) - (a.bitrate || 0); })[0];
   if (!chosen || !chosen.url) return null;
   return { url: chosen.url, format: 'm4a', quality: Math.round((chosen.bitrate || 128000) / 1000) + 'kbps', expiresAt: Math.floor(Date.now() / 1000) + 21600 };
 }
 
 async function youtubeFallback(title, artist) {
-  var query   = (artist ? artist + ' - ' : '') + title;
-  var item    = await youtubeSearch(query);
+  var query = (artist ? artist + ' - ' : '') + title;
+  var item  = await youtubeSearch(query);
   if (!item) { item = await youtubeSearch(title); }
   var videoId = item ? extractYouTubeId(item) : null;
   if (!videoId) return null;
-  console.log('[YT] videoId: ' + videoId); return youtubeStreamUrl(videoId);
+  console.log('[YT] videoId: ' + videoId);
+  return youtubeStreamUrl(videoId);
 }
 
 // ─── Config page ──────────────────────────────────────────────────────────────
@@ -289,7 +345,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, function(req, res) {
 });
 
 app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
-  var q   = cleanText(req.query.q || '');
+  var q = cleanText(req.query.q || '');
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
   var cid = effectiveClientId(req.tokenEntry);
   if (!cid) return res.status(503).json({ error: 'No client_id available yet. Retry in a few seconds.', tracks: [] });
@@ -341,12 +397,12 @@ app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
       .filter(function(p) { return p.is_album !== true; })
       .map(function(p) {
         return {
-          id:         String(p.id),
-          title:      p.title || 'Unknown Playlist',
+          id:          String(p.id),
+          title:       p.title || 'Unknown Playlist',
           description: p.description || null,
-          artworkURL: artworkUrl(p.artwork_url),
-          creator:    (p.user && p.user.username) || null,
-          trackCount: p.track_count || null
+          artworkURL:  artworkUrl(p.artwork_url),
+          creator:     (p.user && p.user.username) || null,
+          trackCount:  p.track_count || null
         };
       });
 
@@ -394,7 +450,12 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async function(req, res) {
         if (streamData && streamData.url) {
           var isProg = chosen.format && chosen.format.protocol === 'progressive';
           console.log('[/stream] SoundCloud OK (' + (isProg ? 'progressive' : 'hls') + ') track ' + trackId);
-          return res.json({ url: streamData.url, format: (chosen.format && chosen.format.mime_type && chosen.format.mime_type.indexOf('aac') !== -1) ? 'aac' : 'mp3', quality: '160kbps', expiresAt: Math.floor(Date.now() / 1000) + (isProg ? 86400 : 3300) });
+          return res.json({
+            url:       streamData.url,
+            format:    (chosen.format && chosen.format.mime_type && chosen.format.mime_type.indexOf('aac') !== -1) ? 'aac' : 'mp3',
+            quality:   '160kbps',
+            expiresAt: Math.floor(Date.now() / 1000) + (isProg ? 86400 : 3300)
+          });
         }
       }
     } catch (err) { console.warn('[/stream] SoundCloud stream failed: ' + err.message); }
@@ -418,7 +479,9 @@ app.get('/u/:token/album/:id', tokenMiddleware, async function(req, res) {
     var playlist = await scGet(cid, 'https://api-v2.soundcloud.com/playlists/' + req.params.id);
     if (!playlist) return res.status(404).json({ error: 'Album not found.' });
 
-    var tracks = (playlist.tracks || []).map(function(t) {
+    var resolved = await resolveStubTracks(cid, playlist.tracks || [], playlist.artwork_url);
+
+    var tracks = resolved.map(function(t) {
       rememberTrack(t);
       var meta = parseArtistTitle(t);
       return {
@@ -464,7 +527,9 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function(req, res) {
 
     if (!user) return res.status(404).json({ error: 'Artist not found.' });
 
-    var topTracks = ((tracksData && tracksData.collection) || []).map(function(t) {
+    var resolved = await resolveStubTracks(cid, (tracksData && tracksData.collection) || [], null);
+
+    var topTracks = resolved.map(function(t) {
       rememberTrack(t);
       var meta = parseArtistTitle(t);
       return {
@@ -511,7 +576,9 @@ app.get('/u/:token/playlist/:id', tokenMiddleware, async function(req, res) {
     var playlist = await scGet(cid, 'https://api-v2.soundcloud.com/playlists/' + req.params.id);
     if (!playlist) return res.status(404).json({ error: 'Playlist not found.' });
 
-    var tracks = (playlist.tracks || []).map(function(t) {
+    var resolved = await resolveStubTracks(cid, playlist.tracks || [], playlist.artwork_url);
+
+    var tracks = resolved.map(function(t) {
       rememberTrack(t);
       var meta = parseArtistTitle(t);
       return {
@@ -566,7 +633,13 @@ app.post('/generate', async function(req, res) {
 });
 
 app.get('/health', function(_req, res) {
-  res.json({ status: 'ok', sharedClientIdReady: !!SHARED_CLIENT_ID, redisConnected: !!(redis && redis.status === 'ready'), activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
+  res.json({
+    status:              'ok',
+    sharedClientIdReady: !!SHARED_CLIENT_ID,
+    redisConnected:      !!(redis && redis.status === 'ready'),
+    activeTokens:        TOKEN_CACHE.size,
+    timestamp:           new Date().toISOString()
+  });
 });
 
 app.listen(PORT, function() {
