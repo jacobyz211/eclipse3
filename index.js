@@ -350,8 +350,36 @@ async function importYtmPlaylist(playlistId) {
   }
 }
 
+// ─── SC short URL expander ───────────────────────────────────────────────
+// on.soundcloud.com/XXXX and snd.sc/XXXX are redirect short links.
+// The SC /resolve API does NOT accept them — we must follow the redirect first
+// to get the canonical soundcloud.com URL before calling the API.
+async function expandScShortUrl(url) {
+  try {
+    var r = await axios.get(url, {
+      maxRedirects: 10,
+      headers: { 'User-Agent': UA },
+      timeout: 10000,
+      validateStatus: function (s) { return s < 500; }
+    });
+    // axios stores the final URL after redirects here:
+    var final = (r.request && r.request.res && r.request.res.responseUrl) || url;
+    console.log('[expandScShortUrl] ' + url + ' -> ' + final);
+    return final;
+  } catch (e) {
+    if (e.response && e.response.headers && e.response.headers.location) {
+      return e.response.headers.location;
+    }
+    return url;
+  }
+}
+
 // ─── SC playlist import ───────────────────────────────────────────────────
 async function importScPlaylist(cid, scUrl) {
+  // Expand on.soundcloud.com / snd.sc short links to full soundcloud.com URLs
+  if (/on\.soundcloud\.com\//.test(scUrl) || /snd\.sc\//.test(scUrl)) {
+    scUrl = await expandScShortUrl(scUrl);
+  }
   var res = await scGet(cid, 'https://api-v2.soundcloud.com/resolve', { url: scUrl });
   if (!res) throw new Error('Could not resolve SoundCloud URL');
   if (res.kind !== 'playlist') throw new Error('Not a playlist (kind: ' + res.kind + ')');
