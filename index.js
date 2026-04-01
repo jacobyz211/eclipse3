@@ -375,6 +375,8 @@ async function importScPlaylist(cid, scUrl) {
 function detectUrlType(url) {
   if (!url) return null;
   if (/soundcloud\.com\/.+\/sets\/.+/.test(url))           return 'sc_playlist';
+  if (/on\.soundcloud\.com\/.+/.test(url))                  return 'sc_playlist'; // short links
+  if (/snd\.sc\/.+/.test(url))                               return 'sc_playlist'; // snd.sc short links
   if (/(?:music\.youtube\.com|youtube\.com).*[?&]list=/.test(url)) return 'ytm_playlist';
   if (/music\.youtube\.com\/browse\/VL/.test(url))         return 'ytm_playlist';
   return null;
@@ -469,8 +471,8 @@ function buildConfigPage(baseUrl) {
   h += '<div class="lbl">Your Addon URL</div>';
   h += '<input type="text" id="impToken" placeholder="Paste your addon URL (auto-fills after generating)">';
   h += '<div class="lbl">Playlist URL</div>';
-  h += '<input type="text" id="impUrl" placeholder="soundcloud.com/artist/sets/name  or  music.youtube.com/playlist?list=...">';
-  h += '<div class="hint">SoundCloud: soundcloud.com/*/sets/* &nbsp;|&nbsp; YouTube Music: music.youtube.com/playlist?list=...</div>';
+  h += '<input type="text" id="impUrl" placeholder="soundcloud.com/artist/sets/name  or  on.soundcloud.com/XXXX  or  music.youtube.com/playlist?list=...">';
+  h += '<div class="hint">SoundCloud: soundcloud.com/*/sets/* or on.soundcloud.com/... &nbsp;|&nbsp; YouTube Music: music.youtube.com/playlist?list=...</div>';
   h += '<div class="status" id="impStatus"></div><div class="preview" id="impPreview"></div>';
   h += '<button class="bg" id="impBtn" onclick="doImport()">Fetch &amp; Download CSV</button>';
   h += '</div>';
@@ -692,7 +694,7 @@ app.get('/u/:token/import', tokenMiddleware, async function (req, res) {
     try { return res.json(await importYtmPlaylist(ytmId)); }
     catch (e) { return res.status(500).json({ error: e.message }); }
   }
-  return res.status(400).json({ error: 'URL not recognised. Use soundcloud.com/*/sets/* or music.youtube.com/playlist?list=...' });
+  return res.status(400).json({ error: 'URL not recognised. Use soundcloud.com/*/sets/*, on.soundcloud.com/..., or music.youtube.com/playlist?list=...' });
 });
 
 app.get('/health', function (_req, res) {
