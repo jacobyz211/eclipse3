@@ -560,7 +560,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, function (req, res) {
     name:        'SoundCloud',
     version:     '3.8.0',
     description: 'SoundCloud + yt-dlp fallback. SNIP previews filtered. Full tracks only.',
-    icon:        'https://a-v2.sndcdn.com/assets/images/sc-icons/ios-orange-2xhdpi-a9dce059.png',
+    icon:        'https://files.softicons.com/download/social-media-icons/simple-icons-by-dan-leech/png/128x128/soundcloud.png',
     resources:   ['search', 'stream', 'catalog'],
     types:       ['track', 'album', 'artist', 'playlist']
   });
