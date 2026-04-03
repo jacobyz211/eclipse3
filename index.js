@@ -659,24 +659,30 @@ app.get('/u/:token/album/:id', tokenMiddleware, async function (req, res) {
   } catch (e) { res.status(500).json({ error: 'Album fetch failed.' }); }
 });
 
-// ─── Artist details (with topTracks) ──────────────────────────────────────
+// ─── Artist details (topTracks + albums) ──────────────────────────────────
 app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
   const rawId = req.params.id;
   const entry = req.tokenEntry;
 
   try {
-    // IDs like sc_user_<userId>
-    const userId = rawId.replace(/^sc_user_/, '');
-    if (!userId) return res.status(400).json({ error: 'Invalid artist id.' });
+    // Your search route currently returns plain numeric IDs for artists
+    // (String(u.id)), not sc_user_*. So rawId is the SoundCloud user id.
+    const userId = String(rawId).replace(/^sc_user_/, '');
+    if (!userId) {
+      return res.status(400).json({ error: 'Invalid artist id.' });
+    }
 
-    await ensureClientId();
+    // Use the same effectiveCid helper and shared client id
     const cid = effectiveCid(entry);
+    if (!cid && !SHARED_CLIENT_ID) {
+      return res.status(503).json({ error: 'No client_id yet. Retry shortly.' });
+    }
 
     // 1) Artist profile
     const userResp = await axios.get(
       'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId),
       {
-        params: { client_id: cid },
+        params: { client_id: cid || SHARED_CLIENT_ID },
         headers: { 'User-Agent': UA, Accept: 'application/json' },
         timeout: 12000
       }
@@ -684,15 +690,15 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
     const user = userResp.data || {};
     const artistName = cleanText(user.username || user.permalink || 'Artist');
     const artworkURL = artworkUrl(user.avatar_url, null);
-    const bio = cleanText(user.description || '');
-    const genres = [];
+    const bio        = cleanText(user.description || '');
+    const genres     = user.genre ? [cleanText(user.genre)] : [];
 
-    // 2) Artist tracks → topTracks
+    // 2) Artist tracks → topTracks (popular first)
     const tracksResp = await axios.get(
       'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId) + '/tracks',
       {
         params: {
-          client_id: cid,
+          client_id: cid || SHARED_CLIENT_ID,
           limit: 50,
           linked_partitioning: 1
         },
@@ -719,14 +725,13 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
 
         return {
           _score: score,
-          id: 'sc_tr_' + String(t.id),
+          id: String(t.id),                 // matches your /stream ids
           title: meta.title,
           artist: meta.artist || artistName,
-          duration: t.duration ? Math.round(t.duration / 1000) : null,
+          duration: t.duration ? Math.floor(t.duration / 1000) : null,
           artworkURL: art,
-          // Eclipse will call /stream later
-          streamURL: null,
-          format: 'mp3'
+          // Eclipse will call /stream/{id}; no streamURL here
+          streamURL: null
         };
       })
       .sort((a, b) => (b._score || 0) - (a._score || 0));
@@ -736,42 +741,35 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
       return rest;
     });
 
-    // 3) Existing albums from playlists (same idea as before)
-    let albums = [];
-    try {
-      const setsResp = await axios.get(
-        'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId) + '/playlists',
-        {
-          params: {
-            client_id: cid,
-            limit: 20,
-            linked_partitioning: 1
-          },
-          headers: { 'User-Agent': UA, Accept: 'application/json' },
-          timeout: 14000
-        }
-      );
+    // 3) Albums from playlists that are marked is_album === true
+    const plResp = await axios.get(
+      'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId) + '/playlists',
+      {
+        params: {
+          client_id: cid || SHARED_CLIENT_ID,
+          limit: 30,
+          linked_partitioning: 1
+        },
+        headers: { 'User-Agent': UA, Accept: 'application/json' },
+        timeout: 14000
+      }
+    );
 
-      const sets = Array.isArray(setsResp.data)
-        ? setsResp.data
-        : (setsResp.data && setsResp.data.collection) || [];
+    const plData = plResp.data || {};
+    const plItems = Array.isArray(plData.collection) ? plData.collection : [];
 
-      albums = sets.map(pl => {
-        const art = artworkUrl(pl.artwork_url, user.avatar_url);
-        return {
-          id: 'sc_pl_' + String(pl.id),
-          title: cleanText(pl.title || 'Playlist'),
-          artist: artistName,
-          artworkURL: art,
-          trackCount: Array.isArray(pl.tracks) ? pl.tracks.length : null,
-          year: scYear(pl)
-        };
-      });
-    } catch (e) {
-      console.warn('[artist playlists]', e.message);
-    }
+    const albums = plItems
+      .filter(p => p.is_album)
+      .map(p => ({
+        id: String(p.id),
+        title: p.title || 'Unknown',
+        artist: artistName,
+        artworkURL: artworkUrl(p.artwork_url, user.avatar_url),
+        trackCount: p.track_count || null,
+        year: scYear(p)
+      }));
 
-    // 4) Eclipse artist shape: adds topTracks but keeps albums
+    // 4) Respond in Eclipse artist format
     res.json({
       id: rawId,
       name: artistName,
