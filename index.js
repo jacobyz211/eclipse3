@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ─── Hi-Fi / Claudochrome instances (monochrome.tf fallback) ────────────────
+// ─── Hi-Fi / Claudochrome instances (monochrome.tf) ─────────────────────────
 const HIFI_INSTANCES = [
   'https://ohio-1.monochrome.tf',
   'https://frankfurt-1.monochrome.tf',
@@ -118,11 +118,11 @@ async function redisLoad(token) {
 }
 
 // ─── Token store ─────────────────────────────────────────────────────────────
-const TOKEN_CACHE     = new Map();
-const IP_CREATES      = new Map();
+const TOKEN_CACHE       = new Map();
+const IP_CREATES        = new Map();
 const MAX_TOKENS_PER_IP = 10;
-const RATE_MAX        = 60;
-const RATE_WINDOW_MS  = 60000;
+const RATE_MAX          = 60;
+const RATE_WINDOW_MS    = 60000;
 
 function generateToken() {
   return crypto.randomBytes(14).toString('hex');
@@ -240,7 +240,6 @@ function scYear(x) {
 }
 
 // SNIP = SoundCloud 30-second preview. BLOCK = region-blocked.
-// Those are not fully playable; treat missing policy as SNIP too.
 function isFullyPlayable(t) {
   if (!t) return false;
   if (t.streamable === false) return false;
@@ -374,7 +373,71 @@ async function resolveStubs(cid, tracks, fbArt) {
   return tracks.map(t => map[String(t.id)] || t).filter(t => !!t.title);
 }
 
-// ─── YTM playlist import (kept, but stream fallback is via Hi-Fi) ────────────
+// ─── Smarter Hi-Fi track search (multiple retries/queries) ──────────────────
+async function hifiFindBestTrack(meta, albumName) {
+  if (!meta || !meta.title) return null;
+
+  const baseTitle  = meta.title;
+  const baseArtist = meta.artist || meta.uploader || '';
+  const queries    = [];
+
+  if (baseArtist) {
+    queries.push(baseArtist + ' ' + baseTitle);
+    queries.push(baseTitle + ' ' + baseArtist);
+  }
+  queries.push(baseTitle);
+  if (albumName) {
+    queries.push(baseTitle + ' ' + albumName);
+  }
+
+  const norm = str => String(str || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const wantTitle  = norm(baseTitle);
+  const wantArtist = norm(baseArtist);
+
+  for (const q of queries) {
+    try {
+      const sData = await hifiGetSafe('/search/', { s: q, limit: 5, offset: 0 });
+      if (!sData) continue;
+
+      let items = [];
+      if (sData.data && Array.isArray(sData.data.items)) items = sData.data.items;
+      else if (Array.isArray(sData.items))               items = sData.items;
+      else if (Array.isArray(sData.data))                items = sData.data;
+      if (!items.length) continue;
+
+      const ranked = items.slice().sort((a, b) => {
+        const aTitle  = norm(a.title);
+        const bTitle  = norm(b.title);
+        const aArtist = norm(
+          (a.artist && a.artist.name) ||
+          (a.artists && a.artists[0] && a.artists[0].name) ||
+          ''
+        );
+        const bArtist = norm(
+          (b.artist && b.artist.name) ||
+          (b.artists && b.artists[0] && b.artists[0].name) ||
+          ''
+        );
+
+        let aScore = 0, bScore = 0;
+        if (aTitle === wantTitle)  aScore += 3;
+        if (bTitle === wantTitle)  bScore += 3;
+        if (aArtist && aArtist === wantArtist) aScore += 2;
+        if (bArtist && bArtist === wantArtist) bScore += 2;
+        if (aTitle.includes(wantTitle)) aScore += 1;
+        if (bTitle.includes(wantTitle)) bScore += 1;
+        return bScore - aScore;
+      });
+
+      for (let i = 0; i < Math.min(2, ranked.length); i++) {
+        if (ranked[i] && ranked[i].id) return ranked[i];
+      }
+    } catch (_e) {}
+  }
+  return null;
+}
+
+// ─── YTM playlist import (unchanged) ────────────────────────────────────────
 async function importYtmPlaylist(playlistId) {
   const cleanId = playlistId.replace(/^VL/, '');
   try {
@@ -463,7 +526,7 @@ async function importScPlaylist(cid, scUrl) {
   };
 }
 
-// ─── Config page (SoundCloud + Claudochrome fallback) ───────────────────────
+// ─── Config page (SoundCloud + Claudochrome) ────────────────────────────────
 function buildConfigPage(baseUrl) {
   let h = '';
   h += '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">';
@@ -504,8 +567,8 @@ function buildConfigPage(baseUrl) {
   h += '<svg class="logo" width="52" height="52" viewBox="0 0 52 52" fill="none"><circle cx="26" cy="26" r="26" fill="#f50"/><path d="M15 30c0-2.4 2-4.4 4.4-4.4s4.4 2 4.4 4.4" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/><path d="M10.5 30c0-4.9 4-8.9 8.9-8.9s8.9 4 8.9 8.9" stroke="#fff" stroke-width="2.5" stroke-linecap="round" opacity=".55"/><rect x="30" y="21" width="3.5" height="17" rx="1.75" fill="#fff"/><rect x="35.5" y="18" width="3.5" height="20" rx="1.75" fill="#fff"/><rect x="41" y="23" width="3.5" height="15" rx="1.75" fill="#fff"/></svg>';
   h += '<div class="card"><h1>SoundCloud for Eclipse</h1>';
   h += '<div class="tip"><b>Save your URL.</b> Copy it to Notes or a bookmark. If the server restarts, paste it below to keep all playlists working.</div>';
-  h += '<p class="sub">SNIP 30-second preview tracks are filtered from all search and album results. Claudochrome (Hi-Fi API, monochrome.tf) is used as a fallback when SoundCloud cannot provide a full stream.</p>';
-  h += '<div class="pills"><span class="pill">Tracks, albums, artists</span><span class="pill">SC playlists</span><span class="pill b">Claudochrome fallback</span><span class="pill b">YTM playlist import</span></div>';
+  h += '<p class="sub">SNIP 30-second preview tracks are filtered from all search and album results. Streams prefer Claudochrome (Hi-Fi API, monochrome.tf) and fall back to SoundCloud if needed.</p>';
+  h += '<div class="pills"><span class="pill">Tracks, albums, artists</span><span class="pill">SC playlists</span><span class="pill b">Claudochrome first</span><span class="pill b">YTM playlist import</span></div>';
   h += '<div class="lbl">SoundCloud Client ID <span style="color:#3a3a3a;font-weight:400;text-transform:none">(optional)</span></div>';
   h += '<input type="text" id="clientId" placeholder="Leave blank to use the shared auto-refreshed ID">';
   h += '<div class="hint">Want your own? Open <a href="https://soundcloud.com" target="_blank">soundcloud.com</a>, press <code>F12</code> → Network, filter <code>api-v2</code>, copy <code>client_id</code>.</div>';
@@ -521,7 +584,7 @@ function buildConfigPage(baseUrl) {
   h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> → Settings → Connections → Add Connection → Addon</div></div>';
   h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap Install</div></div>';
   h += '<div class="step"><div class="sn">4</div><div class="st">Use <b>Playlist Importer</b> below for CSV import into Eclipse Library</div></div>';
-  h += '</div><div class="warn">Your URL is saved to Redis and survives restarts. Claudochrome fallback uses community-hosted Hi-Fi instances; if they are down, only SoundCloud content will play.</div></div>';
+  h += '</div><div class="warn">Your URL is saved to Redis and survives restarts. Claudochrome uses community-hosted Hi-Fi instances; if they are down, playback falls back to SoundCloud only.</div></div>';
   h += '<div class="card"><span class="badge">Playlist Importer</span>';
   h += '<h2>Import SoundCloud or YouTube Music Playlist</h2>';
   h += '<p class="sub">Downloads a CSV you can import in Eclipse via Library → Import CSV.</p>';
@@ -533,7 +596,7 @@ function buildConfigPage(baseUrl) {
   h += '<div class="status" id="impStatus"></div>';
   h += '<div class="preview" id="impPreview"></div>';
   h += '<button class="bg" id="impBtn" onclick="doImport()">Fetch &amp; Download CSV</button></div>';
-  h += '<footer>Eclipse SoundCloud Addon v3.8.0 • Claudochrome fallback via Hi-Fi API (monochrome.tf) • <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
+  h += '<footer>Eclipse SoundCloud + Claudochrome Addon v3.8.0 • <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
   h += '<script>';
   h += 'var _gu="",_ru="";';
   h += 'function generate(){var btn=document.getElementById("genBtn"),cid=document.getElementById("clientId").value.trim();btn.disabled=true;btn.textContent="Generating...";';
@@ -624,16 +687,16 @@ app.get('/health', (req, res) => {
 app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   res.json({
     id:          'com.eclipse.soundcloud.' + req.params.token.slice(0, 8),
-    name:        'SoundCloud + Claudochrome',
-    version:     '3.8.0',
-    description: 'SoundCloud with Claudochrome (Hi-Fi API, monochrome.tf) fallback. SNIP previews filtered; full tracks only.',
+    name:        'SoundCloud',
+    version:     '4.0.0',
+    description: 'SoundCloud search with Claudochrome (Hi-Fi API, monochrome.tf) streams first, then SoundCloud fallback. SNIP previews filtered; full tracks only.',
     icon:        'https://files.softicons.com/download/social-media-icons/simple-icons-by-dan-leech/png/128x128/soundcloud.png',
     resources:   ['search', 'stream', 'catalog'],
     types:       ['track', 'album', 'artist', 'playlist']
   });
 });
 
-// ─── Search ─────────────────────────────────────────────────────────────────
+// ─── Search (SoundCloud only) ────────────────────────────────────────────────
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanText(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
@@ -705,7 +768,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── Stream (SoundCloud primary, Claudochrome/Hi-Fi fallback) ───────────────
+// ─── Stream (Claudochrome/Hi-Fi FIRST, SoundCloud fallback) ────────────────
 app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
   const cid = effectiveCid(req.tokenEntry);
   const tid = req.params.id;
@@ -715,6 +778,7 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
   let track  = null;
   const cached = TRACK_CACHE.get(String(tid)) || null;
 
+  // Fetch SC track once for metadata and SC fallback
   try {
     try {
       track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/soundcloud:tracks:' + tid);
@@ -722,12 +786,68 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
       track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/' + tid);
     }
   } catch (e) {
-    console.warn('[stream] track lookup failed: ' + e.message);
+    console.warn('[stream] SC track lookup failed for ' + tid + ': ' + e.message);
   }
 
   if (track) rememberTrack(track);
 
-  // Try SoundCloud progressive stream only for fully playable tracks
+  const meta = cached || (track ? parseArtistTitle(track) : null);
+  const albumName =
+    track && track.publisher_metadata && track.publisher_metadata.release_title
+      ? track.publisher_metadata.release_title
+      : null;
+
+  // 1) Claudochrome / Hi-Fi FIRST with smarter search
+  try {
+    const best = await hifiFindBestTrack(meta, albumName);
+    if (best && best.id) {
+      const hifiId = best.id;
+      const qList  = ['LOSSLESS', 'HIGH', 'LOW'];
+
+      for (let qi = 0; qi < qList.length; qi++) {
+        const ql = qList[qi];
+        try {
+          const data    = await hifiGet('/track/', { id: hifiId, quality: ql });
+          const payload = (data && data.data) ? data.data : data;
+
+          if (payload && payload.manifest) {
+            const decoded = JSON.parse(
+              Buffer.from(payload.manifest, 'base64').toString('utf8')
+            );
+            const url   = (decoded.urls && decoded.urls[0]) || null;
+            const codec = decoded.codecs || decoded.mimeType || '';
+            if (url) {
+              const isFlac = codec &&
+                (codec.indexOf('flac') !== -1 || codec.indexOf('audio/flac') !== -1);
+              return res.json({
+                url,
+                format:    isFlac ? 'flac' : 'aac',
+                quality:   ql === 'LOSSLESS' ? 'lossless' : (ql === 'HIGH' ? '320kbps' : '128kbps'),
+                expiresAt: Math.floor(Date.now() / 1000) + 21600
+              });
+            }
+          }
+
+          if (payload && payload.url) {
+            return res.json({
+              url:       payload.url,
+              format:    'aac',
+              quality:   'lossless',
+              expiresAt: Math.floor(Date.now() / 1000) + 21600
+            });
+          }
+        } catch (e) {
+          if (qi === qList.length - 1) {
+            console.warn('[stream] Hi-Fi all qualities failed for ' + hifiId + ': ' + e.message);
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[stream] Hi-Fi error for ' + tid + ': ' + e.message);
+  }
+
+  // 2) SoundCloud progressive fallback
   if (track && isFullyPlayable(track)) {
     try {
       const tc   = (track.media && track.media.transcodings) || [];
@@ -735,7 +855,11 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
       if (prog && prog.url) {
         const sd = await scGet(cid, prog.url);
         if (sd && sd.url) {
-          const fmt = prog.format && prog.format.mime_type && prog.format.mime_type.indexOf('aac') !== -1 ? 'aac' : 'mp3';
+          const fmt = prog.format &&
+                      prog.format.mime_type &&
+                      prog.format.mime_type.indexOf('aac') !== -1
+                        ? 'aac'
+                        : 'mp3';
           return res.json({
             url:       sd.url,
             format:    fmt,
@@ -745,63 +869,11 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
         }
       }
     } catch (e) {
-      console.warn('[stream] SC progressive failed: ' + e.message);
+      console.warn('[stream] SC progressive failed for ' + tid + ': ' + e.message);
     }
   }
 
-  // ── Claudochrome / Hi-Fi fallback via monochrome.tf ──
-  const meta = cached || (track ? parseArtistTitle(track) : null);
-  if (!meta || !meta.title) {
-    return res.status(404).json({ error: 'No stream and no metadata for fallback.' });
-  }
-
-  try {
-    const sData = await hifiGet('/search/', { s: meta.artist + ' ' + meta.title, limit: 1, offset: 0 });
-    const items = (sData && sData.data && sData.data.items) ? sData.data.items : [];
-    if (!items.length || !items[0].id) {
-      return res.status(404).json({ error: 'No Claudochrome fallback found.' });
-    }
-    const tId   = items[0].id;
-    const qList = ['LOSSLESS', 'HIGH', 'LOW'];
-
-    for (let qi = 0; qi < qList.length; qi++) {
-      const ql = qList[qi];
-      try {
-        const data    = await hifiGet('/track/', { id: tId, quality: ql });
-        const payload = (data && data.data) ? data.data : data;
-        if (payload && payload.manifest) {
-          const decoded = JSON.parse(Buffer.from(payload.manifest, 'base64').toString('utf8'));
-          const url     = (decoded.urls && decoded.urls[0]) || null;
-          const codec   = decoded.codecs || decoded.mimeType || '';
-          if (url) {
-            const isFlac = codec && (codec.indexOf('flac') !== -1 || codec.indexOf('audio/flac') !== -1);
-            return res.json({
-              url,
-              format:    isFlac ? 'flac' : 'aac',
-              quality:   ql === 'LOSSLESS' ? 'lossless' : (ql === 'HIGH' ? '320kbps' : '128kbps'),
-              expiresAt: Math.floor(Date.now() / 1000) + 21600
-            });
-          }
-        }
-        if (payload && payload.url) {
-          return res.json({
-            url:       payload.url,
-            format:    'aac',
-            quality:   'lossless',
-            expiresAt: Math.floor(Date.now() / 1000) + 21600
-          });
-        }
-      } catch (e) {
-        if (qi === qList.length - 1) {
-          console.error('[stream] Hi-Fi fallback failed for ' + tId + ': ' + e.message);
-        }
-      }
-    }
-    return res.status(404).json({ error: 'No stream found for track ' + tid });
-  } catch (e) {
-    console.error('[stream] Claudochrome fallback error: ' + e.message);
-    return res.status(502).json({ error: 'Fallback stream failed.' });
-  }
+  return res.status(404).json({ error: 'No stream found for track ' + tid });
 });
 
 // ─── Album (SC playlist-as-album) ────────────────────────────────────────────
@@ -936,7 +1008,7 @@ app.get('/u/:token/playlist/:id', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── Import (SC playlist or YTM playlist to CSV) ────────────────────────────
+// ─── Import (SC playlist or YTM playlist to JSON/CSV) ───────────────────────
 app.get('/u/:token/import', tokenMiddleware, async (req, res) => {
   const cid      = effectiveCid(req.tokenEntry);
   const inputUrl = cleanText(req.query.url);
