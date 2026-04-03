@@ -659,22 +659,29 @@ app.get('/u/:token/album/:id', tokenMiddleware, async function (req, res) {
   } catch (e) { res.status(500).json({ error: 'Album fetch failed.' }); }
 });
 
-// ─── Artist details (SoundCloud, Deezer-style) ────────────────────────────
-app.get('/artist/:id', async (req, res) => {
+// ─── Artist details (SoundCloud, Eclipse catalog) ─────────────────────────
+app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
   const userId = String(req.params.id).replace(/^sc_/, '');
+  const entry  = req.tokenEntry;
 
   try {
+    const cid = effectiveCid(entry);
+    if (!cid && !SHARED_CLIENT_ID) {
+      return res.status(503).json({ error: 'No client_id yet. Retry in a few seconds.' });
+    }
+    const clientId = cid || SHARED_CLIENT_ID;
+
     // Profile
     const userResp = await axios.get(
       'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId),
       {
-        params: { client_id: SHARED_CLIENT_ID },
+        params: { client_id: clientId },
         headers: { 'User-Agent': UA, Accept: 'application/json' },
-        timeout: 10000,
+        timeout: 10000
       }
     );
 
-    const user = userResp.data || {};
+    const user       = userResp.data || {};
     const artistName = cleanText(user.username || user.permalink || 'Artist');
     const avatar     = artworkUrl(user.avatar_url, null);
 
@@ -682,9 +689,9 @@ app.get('/artist/:id', async (req, res) => {
     const topResp = await axios.get(
       'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId) + '/tracks',
       {
-        params: { client_id: SHARED_CLIENT_ID, limit: 20 },
+        params: { client_id: clientId, limit: 20, linked_partitioning: 1 },
         headers: { 'User-Agent': UA, Accept: 'application/json' },
-        timeout: 10000,
+        timeout: 10000
       }
     );
 
@@ -693,18 +700,18 @@ app.get('/artist/:id', async (req, res) => {
       : (topResp.data && topResp.data.collection) || [];
 
     const topTracks = rawTop
-      .filter(t => isFullyPlayable(t))
-      .map(t => {
+      .filter(function (t) { return isFullyPlayable(t); })
+      .map(function (t) {
         rememberTrack(t);
         const meta = parseArtistTitle(t);
         const art  = artworkUrl(t.artwork_url, avatar);
         return {
-          id: String(t.id),
+          id: String(t.id),                             // matches /u/:token/stream/:id
           title: meta.title,
           artist: meta.artist || artistName,
           duration: t.duration ? Math.floor(t.duration / 1000) : null,
           artworkURL: art,
-          streamURL: null,
+          streamURL: null                               // Eclipse will call /stream
         };
       });
 
@@ -712,9 +719,9 @@ app.get('/artist/:id', async (req, res) => {
     const albumsResp = await axios.get(
       'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId) + '/playlists',
       {
-        params: { client_id: SHARED_CLIENT_ID, limit: 20 },
+        params: { client_id: clientId, limit: 20, linked_partitioning: 1 },
         headers: { 'User-Agent': UA, Accept: 'application/json' },
-        timeout: 10000,
+        timeout: 10000
       }
     );
 
@@ -723,15 +730,17 @@ app.get('/artist/:id', async (req, res) => {
       : (albumsResp.data && albumsResp.data.collection) || [];
 
     const albums = rawAlbums
-      .filter(p => p.is_album)
-      .map(p => ({
-        id: String(p.id),
-        title: p.title || 'Unknown',
-        artist: artistName,
-        artworkURL: artworkUrl(p.artwork_url, avatar),
-        trackCount: p.track_count || null,
-        year: scYear(p),
-      }));
+      .filter(function (p) { return p.is_album; })
+      .map(function (p) {
+        return {
+          id: String(p.id),
+          title: p.title || 'Unknown',
+          artist: artistName,
+          artworkURL: artworkUrl(p.artwork_url, avatar),
+          trackCount: p.track_count || null,
+          year: scYear(p)
+        };
+      });
 
     res.json({
       id: String(user.id),
@@ -740,7 +749,7 @@ app.get('/artist/:id', async (req, res) => {
       bio: cleanText(user.description || ''),
       genres: user.genre ? [cleanText(user.genre)] : [],
       topTracks,
-      albums,
+      albums
     });
   } catch (err) {
     console.error('[artist]', err.message);
