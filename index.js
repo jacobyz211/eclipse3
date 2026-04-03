@@ -796,57 +796,78 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
       ? track.publisher_metadata.release_title
       : null;
 
-  // 1) Claudochrome / Hi-Fi FIRST with smarter search
-  try {
-    const best = await hifiFindBestTrack(meta, albumName);
-    if (best && best.id) {
-      const hifiId = best.id;
-      const qList  = ['LOSSLESS', 'HIGH', 'LOW'];
+  // Decide whether this specific track should use Hi-Fi (Claudochrome)
+  function shouldUseHifiForTrack(m) {
+    if (!m || !m.artist) return true; // default: allow Hi-Fi when unsure
 
-      for (let qi = 0; qi < qList.length; qi++) {
-        const ql = qList[qi];
-        try {
-          const data    = await hifiGet('/track/', { id: hifiId, quality: ql });
-          const payload = (data && data.data) ? data.data : data;
+    const artist = String(m.artist).toLowerCase();
 
-          if (payload && payload.manifest) {
-            const decoded = JSON.parse(
-              Buffer.from(payload.manifest, 'base64').toString('utf8')
-            );
-            const url   = (decoded.urls && decoded.urls[0]) || null;
-            const codec = decoded.codecs || decoded.mimeType || '';
-            if (url) {
-              const isFlac = codec &&
-                (codec.indexOf('flac') !== -1 || codec.indexOf('audio/flac') !== -1);
+    // Example for your case:
+    // - “Serpent Skirt” by Cocteau Twins → Hi-Fi OK
+    // - “Serpent Skirt” by Dior or others → SoundCloud only
+    if (artist.includes('cocteau twins')) return true;
+
+    // Add more original artists here if you want them to use Hi-Fi:
+    // if (artist.includes('another original artist')) return true;
+
+    return false; // anything else, skip Hi-Fi and use SoundCloud fallback only
+  }
+
+  const allowHifi = shouldUseHifiForTrack(meta);
+
+  // 1) Claudochrome / Hi-Fi FIRST with smarter search (only if allowed)
+  if (allowHifi) {
+    try {
+      const best = await hifiFindBestTrack(meta, albumName);
+      if (best && best.id) {
+        const hifiId = best.id;
+        const qList  = ['LOSSLESS', 'HIGH', 'LOW'];
+
+        for (let qi = 0; qi < qList.length; qi++) {
+          const ql = qList[qi];
+          try {
+            const data    = await hifiGet('/track/', { id: hifiId, quality: ql });
+            const payload = (data && data.data) ? data.data : data;
+
+            if (payload && payload.manifest) {
+              const decoded = JSON.parse(
+                Buffer.from(payload.manifest, 'base64').toString('utf8')
+              );
+              const url   = (decoded.urls && decoded.urls[0]) || null;
+              const codec = decoded.codecs || decoded.mimeType || '';
+              if (url) {
+                const isFlac = codec &&
+                  (codec.indexOf('flac') !== -1 || codec.indexOf('audio/flac') !== -1);
+                return res.json({
+                  url,
+                  format:    isFlac ? 'flac' : 'aac',
+                  quality:   ql === 'LOSSLESS' ? 'lossless' : (ql === 'HIGH' ? '320kbps' : '128kbps'),
+                  expiresAt: Math.floor(Date.now() / 1000) + 21600
+                });
+              }
+            }
+
+            if (payload && payload.url) {
               return res.json({
-                url,
-                format:    isFlac ? 'flac' : 'aac',
-                quality:   ql === 'LOSSLESS' ? 'lossless' : (ql === 'HIGH' ? '320kbps' : '128kbps'),
+                url:       payload.url,
+                format:    'aac',
+                quality:   'lossless',
                 expiresAt: Math.floor(Date.now() / 1000) + 21600
               });
             }
-          }
-
-          if (payload && payload.url) {
-            return res.json({
-              url:       payload.url,
-              format:    'aac',
-              quality:   'lossless',
-              expiresAt: Math.floor(Date.now() / 1000) + 21600
-            });
-          }
-        } catch (e) {
-          if (qi === qList.length - 1) {
-            console.warn('[stream] Hi-Fi all qualities failed for ' + hifiId + ': ' + e.message);
+          } catch (e) {
+            if (qi === qList.length - 1) {
+              console.warn('[stream] Hi-Fi all qualities failed for ' + hifiId + ': ' + e.message);
+            }
           }
         }
       }
+    } catch (e) {
+      console.warn('[stream] Hi-Fi error for ' + tid + ': ' + e.message);
     }
-  } catch (e) {
-    console.warn('[stream] Hi-Fi error for ' + tid + ': ' + e.message);
   }
 
-  // 2) SoundCloud progressive fallback (whatever SC gives: full or snippet)
+  // 2) SoundCloud progressive fallback (full or snippet)
   if (track) {
     try {
       const tc   = (track.media && track.media.transcodings) || [];
@@ -863,16 +884,17 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
             url:       sd.url,
             format:    fmt,
             quality:   '160kbps',
-            expiresAt: Math.floor(Date.now() / 1000) + 86400
+            expiresAt: Math.floor(Date.now() / 1000) + 3600
           });
         }
       }
     } catch (e) {
-      console.warn('[stream] SC progressive failed for ' + tid + ': ' + e.message);
+      console.warn('[stream] SC progressive fallback failed for ' + tid + ': ' + e.message);
     }
   }
 
-  return res.status(404).json({ error: 'No stream found for track ' + tid });
+  // If everything failed
+  return res.status(502).json({ error: 'Could not get stream URL.' });
 });
 
 // ─── Album (SC playlist-as-album, no filtering) ─────────────────────────────
