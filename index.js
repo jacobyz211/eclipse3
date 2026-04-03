@@ -420,17 +420,52 @@ async function hifiFindBestTrack(meta, albumName) {
         );
 
         let aScore = 0, bScore = 0;
-        if (aTitle === wantTitle)  aScore += 3;
-        if (bTitle === wantTitle)  bScore += 3;
-        if (aArtist && aArtist === wantArtist) aScore += 2;
-        if (bArtist && bArtist === wantArtist) bScore += 2;
-        if (aTitle.includes(wantTitle)) aScore += 1;
-        if (bTitle.includes(wantTitle)) bScore += 1;
+
+        // Exact title match
+        if (aTitle === wantTitle) aScore += 5;
+        if (bTitle === wantTitle) bScore += 5;
+
+        // Exact artist match
+        if (wantArtist && aArtist === wantArtist) aScore += 5;
+        if (wantArtist && bArtist === wantArtist) bScore += 5;
+
+        // Partial title match
+        if (wantTitle && aTitle.includes(wantTitle)) aScore += 2;
+        if (wantTitle && bTitle.includes(wantTitle)) bScore += 2;
+
+        // Partial artist match
+        if (wantArtist && aArtist.includes(wantArtist)) aScore += 2;
+        if (wantArtist && bArtist.includes(wantArtist)) bScore += 2;
+
         return bScore - aScore;
       });
 
-      for (let i = 0; i < Math.min(2, ranked.length); i++) {
-        if (ranked[i] && ranked[i].id) return ranked[i];
+      // Only accept a Hi-Fi match if it’s a strong match on both title and artist.
+      const best = ranked[0];
+      if (!best) continue;
+
+      const bestTitle  = norm(best.title);
+      const bestArtist = norm(
+        (best.artist && best.artist.name) ||
+        (best.artists && best.artists[0] && best.artists[0].name) ||
+        ''
+      );
+
+      const titleGood =
+        wantTitle &&
+        (bestTitle === wantTitle || bestTitle.includes(wantTitle));
+
+      const artistGood =
+        !wantArtist || // if SC had no artist meta, we can’t enforce artist
+        (bestArtist &&
+         (bestArtist === wantArtist || bestArtist.includes(wantArtist)));
+
+      // If we have an artist from SoundCloud, require both titleGood and artistGood.
+      if (wantArtist) {
+        if (titleGood && artistGood) return best;
+      } else {
+        // No artist info from SC: still require a very strong title match.
+        if (bestTitle === wantTitle) return best;
       }
     } catch (_e) {}
   }
