@@ -567,7 +567,7 @@ function buildConfigPage(baseUrl) {
   h += '<svg class="logo" width="52" height="52" viewBox="0 0 52 52" fill="none"><circle cx="26" cy="26" r="26" fill="#f50"/><path d="M15 30c0-2.4 2-4.4 4.4-4.4s4.4 2 4.4 4.4" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/><path d="M10.5 30c0-4.9 4-8.9 8.9-8.9s8.9 4 8.9 8.9" stroke="#fff" stroke-width="2.5" stroke-linecap="round" opacity=".55"/><rect x="30" y="21" width="3.5" height="17" rx="1.75" fill="#fff"/><rect x="35.5" y="18" width="3.5" height="20" rx="1.75" fill="#fff"/><rect x="41" y="23" width="3.5" height="15" rx="1.75" fill="#fff"/></svg>';
   h += '<div class="card"><h1>SoundCloud for Eclipse</h1>';
   h += '<div class="tip"><b>Save your URL.</b> Copy it to Notes or a bookmark. If the server restarts, paste it below to keep all playlists working.</div>';
-  h += '<p class="sub">SNIP 30-second preview tracks are filtered from all search and album results. Streams prefer Claudochrome (Hi-Fi API, monochrome.tf) and fall back to SoundCloud if needed.</p>';
+  h += '<p class="sub">All SoundCloud tracks (including previews and + songs) show in search; streams prefer Claudochrome (Hi-Fi API, monochrome.tf) and fall back to SoundCloud if needed.</p>';
   h += '<div class="pills"><span class="pill">Tracks, albums, artists</span><span class="pill">SC playlists</span><span class="pill b">Claudochrome first</span><span class="pill b">YTM playlist import</span></div>';
   h += '<div class="lbl">SoundCloud Client ID <span style="color:#3a3a3a;font-weight:400;text-transform:none">(optional)</span></div>';
   h += '<input type="text" id="clientId" placeholder="Leave blank to use the shared auto-refreshed ID">';
@@ -596,7 +596,7 @@ function buildConfigPage(baseUrl) {
   h += '<div class="status" id="impStatus"></div>';
   h += '<div class="preview" id="impPreview"></div>';
   h += '<button class="bg" id="impBtn" onclick="doImport()">Fetch &amp; Download CSV</button></div>';
-  h += '<footer>Eclipse SoundCloud + Claudochrome Addon v3.8.0 • <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
+  h += '<footer>Eclipse SoundCloud + Claudochrome Addon v4.0.0 • <a href="' + baseUrl + '/health" target="_blank" style="color:#333;text-decoration:none">' + baseUrl + '</a></footer>';
   h += '<script>';
   h += 'var _gu="",_ru="";';
   h += 'function generate(){var btn=document.getElementById("genBtn"),cid=document.getElementById("clientId").value.trim();btn.disabled=true;btn.textContent="Generating...";';
@@ -673,7 +673,7 @@ app.post('/refresh', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status:              'ok',
-    version:             '3.8.0',
+    version:             '4.0.0',
     sharedClientIdReady: !!SHARED_CLIENT_ID,
     redisConnected:      !!(redis && redis.status === 'ready'),
     hifiInstance:        activeInstance,
@@ -689,14 +689,14 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
     id:          'com.eclipse.soundcloud.' + req.params.token.slice(0, 8),
     name:        'SoundCloud',
     version:     '4.0.0',
-    description: 'SoundCloud search with Claudochrome (Hi-Fi API, monochrome.tf) streams first, then SoundCloud fallback. SNIP previews filtered; full tracks only.',
+    description: 'SoundCloud search with Claudochrome (Hi-Fi API, monochrome.tf) streams first, then SoundCloud fallback. Previews and + songs still appear in search.',
     icon:        'https://files.softicons.com/download/social-media-icons/simple-icons-by-dan-leech/png/128x128/soundcloud.png',
     resources:   ['search', 'stream', 'catalog'],
     types:       ['track', 'album', 'artist', 'playlist']
   });
 });
 
-// ─── Search (SoundCloud only) ────────────────────────────────────────────────
+// ─── Search (SoundCloud only, no filtering) ─────────────────────────────────
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanText(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
@@ -718,7 +718,6 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
     const allPl    = plRes.collection || [];
 
     const tracks = (trackRes.collection || [])
-      .filter(isFullyPlayable)
       .map(t => {
         rememberTrack(t);
         const m = parseArtistTitle(t);
@@ -847,8 +846,8 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
     console.warn('[stream] Hi-Fi error for ' + tid + ': ' + e.message);
   }
 
-  // 2) SoundCloud progressive fallback
-  if (track && isFullyPlayable(track)) {
+  // 2) SoundCloud progressive fallback (whatever SC gives: full or snippet)
+  if (track) {
     try {
       const tc   = (track.media && track.media.transcodings) || [];
       const prog = tc.find(t => t.format && t.format.protocol === 'progressive');
@@ -876,7 +875,7 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
   return res.status(404).json({ error: 'No stream found for track ' + tid });
 });
 
-// ─── Album (SC playlist-as-album) ────────────────────────────────────────────
+// ─── Album (SC playlist-as-album, no filtering) ─────────────────────────────
 app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   const cid = effectiveCid(req.tokenEntry);
   if (!cid) return res.status(503).json({ error: 'No client_id.' });
@@ -884,7 +883,7 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
     const pl = await scGet(cid, 'https://api-v2.soundcloud.com/playlists/' + req.params.id);
     if (!pl) return res.status(404).json({ error: 'Album not found.' });
     const resolved = await resolveStubs(cid, pl.tracks || [], pl.artwork_url);
-    const tracks   = resolved.filter(isFullyPlayable).map((t, i) => {
+    const tracks   = resolved.map((t, i) => {
       rememberTrack(t);
       const m = parseArtistTitle(t);
       return {
@@ -911,7 +910,7 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── Artist ─────────────────────────────────────────────────────────────────
+// ─── Artist (no filtering) ──────────────────────────────────────────────────
 app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   const cid = effectiveCid(req.tokenEntry);
   if (!cid) return res.status(503).json({ error: 'No client_id.' });
@@ -927,7 +926,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
     const plRes = results[2] || { collection: [] };
 
     const resolved = await resolveStubs(cid, trRes.collection || [], null);
-    const topTracks = resolved.filter(isFullyPlayable).map(t => {
+    const topTracks = resolved.map(t => {
       rememberTrack(t);
       const m = parseArtistTitle(t);
       return {
@@ -1042,5 +1041,5 @@ app.get('/u/:token/import', tokenMiddleware, async (req, res) => {
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('Eclipse SoundCloud + Claudochrome Addon v3.8.0 on port ' + PORT);
+  console.log('Eclipse SoundCloud + Claudochrome Addon v4.0.0 on port ' + PORT);
 });
