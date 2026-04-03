@@ -659,30 +659,132 @@ app.get('/u/:token/album/:id', tokenMiddleware, async function (req, res) {
   } catch (e) { res.status(500).json({ error: 'Album fetch failed.' }); }
 });
 
+// ─── Artist details (with topTracks) ──────────────────────────────────────
 app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
-  var cid = effectiveCid(req.tokenEntry);
-  if (!cid) return res.status(503).json({ error: 'No client_id.' });
+  const rawId = req.params.id;
+  const entry = req.tokenEntry;
+
   try {
-    var results = await Promise.all([
-      scGet(cid, 'https://api-v2.soundcloud.com/users/' + req.params.id),
-      scGet(cid, 'https://api-v2.soundcloud.com/users/' + req.params.id + '/tracks',    { limit: 10, linked_partitioning: 1 }).catch(function () { return null; }),
-      scGet(cid, 'https://api-v2.soundcloud.com/users/' + req.params.id + '/playlists', { limit: 20, linked_partitioning: 1 }).catch(function () { return null; })
-    ]);
-    var user = results[0];
-    if (!user) return res.status(404).json({ error: 'Artist not found.' });
-    var resolved = await resolveStubs(cid, (results[1] && results[1].collection) || [], null);
-    res.json({
-      id: String(user.id), name: user.username || 'Unknown', artworkURL: artworkUrl(user.avatar_url),
-      bio: user.description || null, genres: user.genre ? [user.genre] : [],
-      topTracks: resolved.filter(isFullyPlayable).map(function (t) {
-        rememberTrack(t); var m = parseArtistTitle(t);
-        return { id: String(t.id), title: m.title || t.title || 'Unknown', artist: m.artist || user.username || 'Unknown', duration: t.duration ? Math.floor(t.duration / 1000) : null, artworkURL: artworkUrl(t.artwork_url) };
-      }),
-      albums: ((results[2] && results[2].collection) || []).filter(function (p) { return p.is_album === true; }).map(function (p) {
-        return { id: String(p.id), title: p.title || 'Unknown', artist: user.username || 'Unknown', artworkURL: artworkUrl(p.artwork_url), trackCount: p.track_count || null, year: scYear(p) };
+    // IDs like sc_user_<userId>
+    const userId = rawId.replace(/^sc_user_/, '');
+    if (!userId) return res.status(400).json({ error: 'Invalid artist id.' });
+
+    await ensureClientId();
+    const cid = effectiveCid(entry);
+
+    // 1) Artist profile
+    const userResp = await axios.get(
+      'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId),
+      {
+        params: { client_id: cid },
+        headers: { 'User-Agent': UA, Accept: 'application/json' },
+        timeout: 12000
+      }
+    );
+    const user = userResp.data || {};
+    const artistName = cleanText(user.username || user.permalink || 'Artist');
+    const artworkURL = artworkUrl(user.avatar_url, null);
+    const bio = cleanText(user.description || '');
+    const genres = [];
+
+    // 2) Artist tracks → topTracks
+    const tracksResp = await axios.get(
+      'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId) + '/tracks',
+      {
+        params: {
+          client_id: cid,
+          limit: 50,
+          linked_partitioning: 1
+        },
+        headers: { 'User-Agent': UA, Accept: 'application/json' },
+        timeout: 14000
+      }
+    );
+
+    const rawTracks = Array.isArray(tracksResp.data)
+      ? tracksResp.data
+      : (tracksResp.data && tracksResp.data.collection) || [];
+
+    const scored = rawTracks
+      .filter(t => isFullyPlayable(t) && t.kind === 'track')
+      .map(t => {
+        rememberTrack(t);
+        const plays   = Number(t.playback_count || 0);
+        const likes   = Number(t.likes_count || t.favoritings_count || 0);
+        const reposts = Number(t.reposts_count || 0);
+        const score   = plays + likes * 3 + reposts * 5;
+
+        const meta = parseArtistTitle(t);
+        const art  = artworkUrl(t.artwork_url, user.avatar_url);
+
+        return {
+          _score: score,
+          id: 'sc_tr_' + String(t.id),
+          title: meta.title,
+          artist: meta.artist || artistName,
+          duration: t.duration ? Math.round(t.duration / 1000) : null,
+          artworkURL: art,
+          // Eclipse will call /stream later
+          streamURL: null,
+          format: 'mp3'
+        };
       })
+      .sort((a, b) => (b._score || 0) - (a._score || 0));
+
+    const topTracks = scored.slice(0, 12).map(t => {
+      const { _score, ...rest } = t;
+      return rest;
     });
-  } catch (e) { console.error('[artist] ' + e.message); res.status(500).json({ error: 'Artist fetch failed.' }); }
+
+    // 3) Existing albums from playlists (same idea as before)
+    let albums = [];
+    try {
+      const setsResp = await axios.get(
+        'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId) + '/playlists',
+        {
+          params: {
+            client_id: cid,
+            limit: 20,
+            linked_partitioning: 1
+          },
+          headers: { 'User-Agent': UA, Accept: 'application/json' },
+          timeout: 14000
+        }
+      );
+
+      const sets = Array.isArray(setsResp.data)
+        ? setsResp.data
+        : (setsResp.data && setsResp.data.collection) || [];
+
+      albums = sets.map(pl => {
+        const art = artworkUrl(pl.artwork_url, user.avatar_url);
+        return {
+          id: 'sc_pl_' + String(pl.id),
+          title: cleanText(pl.title || 'Playlist'),
+          artist: artistName,
+          artworkURL: art,
+          trackCount: Array.isArray(pl.tracks) ? pl.tracks.length : null,
+          year: scYear(pl)
+        };
+      });
+    } catch (e) {
+      console.warn('[artist playlists]', e.message);
+    }
+
+    // 4) Eclipse artist shape: adds topTracks but keeps albums
+    res.json({
+      id: rawId,
+      name: artistName,
+      artworkURL,
+      bio: bio || null,
+      genres,
+      topTracks,
+      albums
+    });
+  } catch (e) {
+    console.error('[artist]', e.message);
+    res.status(500).json({ error: 'Artist fetch failed.' });
+  }
 });
 
 app.get('/u/:token/playlist/:id', tokenMiddleware, async function (req, res) {
