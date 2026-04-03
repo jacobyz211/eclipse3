@@ -665,14 +665,13 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
   const entry = req.tokenEntry;
 
   try {
-    // Your search route currently returns plain numeric IDs for artists
-    // (String(u.id)), not sc_user_*. So rawId is the SoundCloud user id.
+    // Your /u/:token/search returns numeric SoundCloud user IDs as strings,
+    // so rawId is already the SC user ID (e.g. "12345678").
     const userId = String(rawId).replace(/^sc_user_/, '');
     if (!userId) {
       return res.status(400).json({ error: 'Invalid artist id.' });
     }
 
-    // Use the same effectiveCid helper and shared client id
     const cid = effectiveCid(entry);
     if (!cid && !SHARED_CLIENT_ID) {
       return res.status(503).json({ error: 'No client_id yet. Retry shortly.' });
@@ -687,13 +686,14 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
         timeout: 12000
       }
     );
+
     const user = userResp.data || {};
     const artistName = cleanText(user.username || user.permalink || 'Artist');
     const artworkURL = artworkUrl(user.avatar_url, null);
     const bio        = cleanText(user.description || '');
     const genres     = user.genre ? [cleanText(user.genre)] : [];
 
-    // 2) Artist tracks → topTracks (popular first)
+    // 2) Top tracks: fetch artist tracks and sort by popularity
     const tracksResp = await axios.get(
       'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId) + '/tracks',
       {
@@ -712,8 +712,8 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
       : (tracksResp.data && tracksResp.data.collection) || [];
 
     const scored = rawTracks
-      .filter(t => isFullyPlayable(t) && t.kind === 'track')
-      .map(t => {
+      .filter(function (t) { return isFullyPlayable(t) && t.kind === 'track'; })
+      .map(function (t) {
         rememberTrack(t);
         const plays   = Number(t.playback_count || 0);
         const likes   = Number(t.likes_count || t.favoritings_count || 0);
@@ -725,29 +725,30 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
 
         return {
           _score: score,
-          id: String(t.id),                 // matches your /stream ids
+          id: String(t.id), // matches ids used by /u/:token/stream/:id
           title: meta.title,
           artist: meta.artist || artistName,
           duration: t.duration ? Math.floor(t.duration / 1000) : null,
           artworkURL: art,
-          // Eclipse will call /stream/{id}; no streamURL here
+          // Eclipse will call /stream/{id} to resolve this
           streamURL: null
         };
       })
-      .sort((a, b) => (b._score || 0) - (a._score || 0));
+      .sort(function (a, b) { return (b._score || 0) - (a._score || 0); });
 
-    const topTracks = scored.slice(0, 12).map(t => {
-      const { _score, ...rest } = t;
-      return rest;
+    const topTracks = scored.slice(0, 20).map(function (t) {
+      const out = Object.assign({}, t);
+      delete out._score;
+      return out;
     });
 
-    // 3) Albums from playlists that are marked is_album === true
+    // 3) Albums: user playlists where is_album === true
     const plResp = await axios.get(
       'https://api-v2.soundcloud.com/users/' + encodeURIComponent(userId) + '/playlists',
       {
         params: {
           client_id: cid || SHARED_CLIENT_ID,
-          limit: 30,
+          limit: 20,
           linked_partitioning: 1
         },
         headers: { 'User-Agent': UA, Accept: 'application/json' },
@@ -755,26 +756,28 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function (req, res) {
       }
     );
 
-    const plData = plResp.data || {};
+    const plData  = plResp.data || {};
     const plItems = Array.isArray(plData.collection) ? plData.collection : [];
 
     const albums = plItems
-      .filter(p => p.is_album)
-      .map(p => ({
-        id: String(p.id),
-        title: p.title || 'Unknown',
-        artist: artistName,
-        artworkURL: artworkUrl(p.artwork_url, user.avatar_url),
-        trackCount: p.track_count || null,
-        year: scYear(p)
-      }));
+      .filter(function (p) { return p.is_album; })
+      .map(function (p) {
+        return {
+          id: String(p.id),
+          title: p.title || 'Unknown',
+          artist: artistName,
+          artworkURL: artworkUrl(p.artwork_url, user.avatar_url),
+          trackCount: p.track_count || null,
+          year: scYear(p)
+        };
+      });
 
-    // 4) Respond in Eclipse artist format
+    // 4) Final Eclipse artist payload (matches guide)
     res.json({
       id: rawId,
       name: artistName,
       artworkURL,
-      bio: bio || null,
+      bio: bio || '',
       genres,
       topTracks,
       albums
