@@ -1078,3 +1078,5 @@ app.get('/u/:token/import', tokenMiddleware, async (req, res) => {
 app.listen(PORT, () => {
   console.log('Eclipse SoundCloud + Claudochrome Addon v4.0.0 on port ' + PORT);
 });
+
+module.exports = app;
