@@ -308,11 +308,24 @@ async function tryExtract() {
 async function fetchSharedClientId() {
   if (process.env.SC_CLIENT_ID) {
     SHARED_CLIENT_ID = process.env.SC_CLIENT_ID;
-    console.log('[clientid] from env');
     return;
   }
-  const delays  = [5000, 10000, 15000, 30000, 60000];
-  let attempt   = 0;
+
+  // Check Redis first
+  if (redis) {
+    try {
+      const cached = await redis.get('sc:shared_client_id');
+      if (cached) {
+        SHARED_CLIENT_ID = cached;
+        console.log('[clientid] loaded from Redis');
+        return;
+      }
+    } catch (_e) {}
+  }
+
+  // Not in Redis — scrape it
+  const delays = [5000, 10000, 15000, 30000, 60000];
+  let attempt  = 0;
   while (true) {
     attempt++;
     try {
@@ -320,11 +333,20 @@ async function fetchSharedClientId() {
       if (!id) throw new Error('not found');
       SHARED_CLIENT_ID = id;
       console.log('[clientid] obtained attempt ' + attempt);
-      setTimeout(() => { SHARED_CLIENT_ID = null; fetchSharedClientId(); }, 6 * 60 * 60 * 1000);
+
+      // Save to Redis for 5 hours
+      if (redis) {
+        await redis.set('sc:shared_client_id', id, 'EX', 18000);
+      }
+
+      setTimeout(() => {
+        SHARED_CLIENT_ID = null;
+        if (redis) redis.del('sc:shared_client_id');
+        fetchSharedClientId();
+      }, 5 * 60 * 60 * 1000);
       return;
     } catch (_e) {
       await sleep(delays[Math.min(attempt - 1, delays.length - 1)]);
-      console.log('[clientid] retrying...');
     }
   }
 }
@@ -736,9 +758,17 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanText(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
 
+  // Wait up to 8 seconds for client ID if not ready yet
+  if (!SHARED_CLIENT_ID) {
+    await fetchSharedClientId();
+  }
+
   const cid = effectiveCid(req.tokenEntry);
   if (!cid) return res.status(503).json({ error: 'No client_id yet. Retry in a few seconds.' });
 
+  // ... rest of your search code unchanged
+
+  
   try {
     const results = await Promise.all([
       scGet(cid, 'https://api-v2.soundcloud.com/search/tracks',     { q, limit: 20, offset: 0, linked_partitioning: 1 }),
