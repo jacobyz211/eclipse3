@@ -18,6 +18,7 @@ app.use(express.json());
 
 // ─── Hi-Fi / Claudochrome instances (monochrome.tf) ─────────────────────────
 const HIFI_INSTANCES = [
+  'https://tidal-api.binimum.org',
   'https://ohio-1.monochrome.tf',
   'https://frankfurt-1.monochrome.tf',
   'https://eu-central.monochrome.tf',
