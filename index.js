@@ -936,8 +936,63 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
     console.warn('[stream] Hi-Fi error for ' + tid + ': ' + e.message);
   }
 
-  // 2) SoundCloud progressive fallback (whatever SC gives: full or snippet)
+  // 2) SoundCloud fallback — check if snippet first, attempt HiFi title-search if so
   if (track) {
+    const isSnippet = !isFullyPlayable(track) ||
+      (track.full_duration && track.duration && track.full_duration > track.duration + 5000);
+
+    if (isSnippet && meta) {
+      // HiFi direct-ID lookup already failed — try HiFi by raw title search
+      // Handles cases where SC uploader name != real TIDAL artist name
+      const titleQueries = [];
+      if (meta.rawTitle && meta.rawTitle.includes(' - ')) {
+        const parts = meta.rawTitle.split(' - ');
+        titleQueries.push(parts[0].trim() + ' ' + parts.slice(1).join(' - ').trim());
+        titleQueries.push(parts.slice(1).join(' - ').trim());
+      }
+      if (meta.artist && meta.title) titleQueries.push(meta.artist + ' ' + meta.title);
+      if (meta.title) titleQueries.push(meta.title);
+
+      for (const searchQ of titleQueries) {
+        try {
+          const sData = await hifiGetSafe('/search/', { s: searchQ, limit: 5, offset: 0 });
+          const items = (sData && sData.data && sData.data.items) ? sData.data.items
+                      : (sData && Array.isArray(sData.items)) ? sData.items : [];
+          if (!items.length) continue;
+          const norm = s => String(s).toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
+          const wantTitle = norm(meta.title);
+          const best = items.find(t => norm(t.title) === wantTitle) || items[0];
+          if (!best || !best.id) continue;
+          for (const ql of ['LOSSLESS', 'HIGH', 'LOW']) {
+            try {
+              const data    = await hifiGet('/track/', { id: best.id, quality: ql });
+              const payload = (data && data.data) ? data.data : data;
+              if (payload && payload.manifest) {
+                const decoded = JSON.parse(Buffer.from(payload.manifest, 'base64').toString('utf8'));
+                const url     = decoded.urls && decoded.urls[0];
+                const codec   = decoded.codecs || decoded.mimeType || '';
+                if (url) {
+                  console.log('[stream] HiFi title-search fallback hit for ' + tid + ' via "' + searchQ + '"');
+                  return res.json({
+                    url,
+                    format:    (codec.indexOf('flac') !== -1 || codec.indexOf('audio/flac') !== -1) ? 'flac' : 'aac',
+                    quality:   ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '128kbps',
+                    expiresAt: Math.floor(Date.now() / 1000) + 21600
+                  });
+                }
+              }
+              if (payload && payload.url) {
+                return res.json({ url: payload.url, format: 'aac', quality: 'lossless', expiresAt: Math.floor(Date.now() / 1000) + 21600 });
+              }
+            } catch (_e) {}
+          }
+        } catch (_e) {}
+      }
+      console.warn('[stream] ' + tid + ' is snippet and HiFi title-search also failed');
+      return res.status(404).json({ error: 'Track is subscription-only. No full stream available.' });
+    }
+
+    // Track is fully playable on SC — serve it
     try {
       const tc   = (track.media && track.media.transcodings) || [];
       const prog = tc.find(t => t.format && t.format.protocol === 'progressive');
