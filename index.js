@@ -18,14 +18,16 @@ app.use(express.json());
 
 // ─── Hi-Fi / Claudochrome instances (monochrome.tf) ─────────────────────────
 const HIFI_INSTANCES = [
-  'https://tidal-api.binimum.org',
+  // Confirmed working (from Vercel logs 2026-04-17)
   'https://ohio-1.monochrome.tf',
   'https://frankfurt-1.monochrome.tf',
   'https://eu-central.monochrome.tf',
   'https://us-west.monochrome.tf',
+  'https://tidal-api.binimum.org',
   'https://hifi.geeked.wtf',
-  'https://hifi-one.spotisaver.net',
-  'https://monochrome-api.samidy.com'
+  // Dead/403ing — kept as last resort only
+  'https://monochrome-api.samidy.com',
+  // 'https://hifi-one.spotisaver.net',  // ENOTFOUND — removed
 ];
 let activeInstance  = HIFI_INSTANCES[0];
 let instanceHealthy = false;
@@ -44,7 +46,7 @@ async function hifiGet(path, params) {
       const r = await axios.get(inst + path, {
         params:  params || {},
         headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-        timeout: 15000
+        timeout: 4000
       });
       if (r.status === 200 && r.data) {
         if (inst !== activeInstance) {
@@ -71,7 +73,7 @@ async function checkInstances() {
     try {
       await axios.get(inst + '/search/', {
         params: { s: 'test', limit: 1 },
-        timeout: 8000
+        timeout: 4000
       });
       activeInstance  = inst;
       instanceHealthy = true;
