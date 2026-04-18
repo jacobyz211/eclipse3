@@ -784,6 +784,13 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
     const allPl    = plRes.collection || [];
 
     const tracks = (trackRes.collection || [])
+      .filter(t => {
+        // Drop snipped/blocked/sub-only tracks — HiFi will serve them instead
+        if (!isFullyPlayable(t)) return false;
+        // Drop if full_duration >> duration (preview clip)
+        if (t.full_duration && t.duration && t.full_duration > t.duration + 5000) return false;
+        return true;
+      })
       .map(t => {
         rememberTrack(t);
         const m = parseArtistTitle(t);
@@ -792,7 +799,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
           title:      m.title || 'Unknown',
           artist:     m.artist || 'Unknown',
           album:      null,
-          duration:   t.duration ? Math.floor(t.duration / 1000) : null,
+          duration:   t.full_duration ? Math.floor(t.full_duration / 1000) : (t.duration ? Math.floor(t.duration / 1000) : null),
           artworkURL: artworkUrl(t.artwork_url),
           format:     'aac'
         };
@@ -912,8 +919,18 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
     console.warn('[stream] Hi-Fi error for ' + tid + ': ' + e.message);
   }
 
-  // 2) SoundCloud progressive fallback (whatever SC gives: full or snippet)
+  // 2) SoundCloud progressive fallback — only if track is fully playable (not a snippet)
   if (track) {
+    // Refuse to serve snipped/blocked/sub-only tracks — HiFi already failed, return 404
+    if (!isFullyPlayable(track)) {
+      console.warn('[stream] SC track ' + tid + ' is snipped/blocked, refusing to serve preview');
+      return res.status(404).json({ error: 'Track is subscription-only or region-blocked. No stream available.' });
+    }
+    // Also check full_duration vs duration — if SC only gave us a clip, refuse it
+    if (track.full_duration && track.duration && track.full_duration > track.duration + 5000) {
+      console.warn('[stream] SC track ' + tid + ' appears to be a preview clip (duration mismatch), refusing');
+      return res.status(404).json({ error: 'Track preview only. No full stream available.' });
+    }
     try {
       const tc   = (track.media && track.media.transcodings) || [];
       const prog = tc.find(t => t.format && t.format.protocol === 'progressive');
