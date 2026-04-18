@@ -409,6 +409,7 @@ async function hifiFindBestTrack(meta, albumName) {
     queries.push(baseTitle + ' ' + baseArtist);
   }
   queries.push(baseTitle);
+  // Also try just the title alone as a last resort (SC uploader ≠ real artist)
   if (albumName) {
     queries.push(baseTitle + ' ' + albumName);
   }
@@ -484,8 +485,12 @@ async function hifiFindBestTrack(meta, albumName) {
          (bestArtist === wantArtist || bestArtist.includes(wantArtist)));
 
       // If we have an artist from SoundCloud, require both titleGood and artistGood.
+      // Exception: SC snippet tracks often have wrong artist (uploader != real artist).
+      // Accept exact title match even when artist doesn't match.
       if (wantArtist) {
         if (titleGood && artistGood) return best;
+        // Relaxed: exact title match is enough (handles uploader-as-artist SC metadata)
+        if (bestTitle === wantTitle) return best;
       } else {
         // No artist info from SC: still require a very strong title match.
         if (bestTitle === wantTitle) return best;
@@ -792,8 +797,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
           title:      m.title || 'Unknown',
           artist:     m.artist || 'Unknown',
           album:      null,
-          // Use full_duration so correct length shows even for snippet tracks
-          duration:   t.full_duration ? Math.floor(t.full_duration / 1000) : (t.duration ? Math.floor(t.duration / 1000) : null),
+          duration:   (t.full_duration || t.duration) ? Math.floor((t.full_duration || t.duration) / 1000) : null,
           artworkURL: artworkUrl(t.artwork_url),
           format:     'aac'
         };
@@ -864,8 +868,27 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
       : null;
 
   // 1) Claudochrome / Hi-Fi FIRST with smarter search
+  // SC snippet tracks often encode the real artist in the title as "Artist - Song"
+  // Try that split as an alternate meta if the primary search fails
+  let _hifiBest = null;
   try {
-    const best = await hifiFindBestTrack(meta, albumName);
+    _hifiBest = await hifiFindBestTrack(meta, albumName);
+    if (!_hifiBest && meta && meta.rawTitle && meta.rawTitle.includes(' - ')) {
+      const _parts = meta.rawTitle.split(' - ');
+      const _altMeta = {
+        title:    _parts.slice(1).join(' - ').trim(),
+        artist:   _parts[0].trim(),
+        uploader: meta.uploader,
+        rawTitle: meta.rawTitle
+      };
+      _hifiBest = await hifiFindBestTrack(_altMeta, albumName);
+      if (_hifiBest) console.log('[stream] HiFi found via title-split for ' + tid);
+    }
+  } catch (_fe) {
+    console.warn('[stream] hifiFindBestTrack outer error: ' + _fe.message);
+  }
+  try {
+    const best = _hifiBest;
     if (best && best.id) {
       const hifiId = best.id;
       const qList  = ['LOSSLESS', 'HIGH', 'LOW'];
@@ -913,8 +936,7 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
     console.warn('[stream] Hi-Fi error for ' + tid + ': ' + e.message);
   }
 
-  // 2) SoundCloud fallback — serve whatever SC has (full track or snippet)
-  //    HiFi was already tried above. If it failed, at least give the user something.
+  // 2) SoundCloud progressive fallback (whatever SC gives: full or snippet)
   if (track) {
     try {
       const tc   = (track.media && track.media.transcodings) || [];
@@ -927,9 +949,6 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
                       prog.format.mime_type.indexOf('aac') !== -1
                         ? 'aac'
                         : 'mp3';
-          const isSnippet = !isFullyPlayable(track) ||
-            (track.full_duration && track.duration && track.full_duration > track.duration + 5000);
-          console.log('[stream] SC fallback for ' + tid + (isSnippet ? ' (snippet/preview)' : ' (full)'));
           return res.json({
             url:       sd.url,
             format:    fmt,
