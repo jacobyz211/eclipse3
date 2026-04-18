@@ -18,16 +18,13 @@ app.use(express.json());
 
 // ─── Hi-Fi / Claudochrome instances (monochrome.tf) ─────────────────────────
 const HIFI_INSTANCES = [
-  // Confirmed working (from Vercel logs 2026-04-17)
+  'https://tidal-api.binimum.org',
   'https://ohio-1.monochrome.tf',
   'https://frankfurt-1.monochrome.tf',
   'https://eu-central.monochrome.tf',
   'https://us-west.monochrome.tf',
-  'https://tidal-api.binimum.org',
   'https://hifi.geeked.wtf',
-  // Dead/403ing — kept as last resort only
-  'https://monochrome-api.samidy.com',
-  // 'https://hifi-one.spotisaver.net',  // ENOTFOUND — removed
+  'https://monochrome-api.samidy.com'
 ];
 let activeInstance  = HIFI_INSTANCES[0];
 let instanceHealthy = false;
@@ -46,7 +43,7 @@ async function hifiGet(path, params) {
       const r = await axios.get(inst + path, {
         params:  params || {},
         headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-        timeout: 4000
+        timeout: 15000
       });
       if (r.status === 200 && r.data) {
         if (inst !== activeInstance) {
@@ -73,7 +70,7 @@ async function checkInstances() {
     try {
       await axios.get(inst + '/search/', {
         params: { s: 'test', limit: 1 },
-        timeout: 4000
+        timeout: 8000
       });
       activeInstance  = inst;
       instanceHealthy = true;
@@ -411,7 +408,6 @@ async function hifiFindBestTrack(meta, albumName) {
     queries.push(baseTitle + ' ' + baseArtist);
   }
   queries.push(baseTitle);
-  // Also try just the title alone as a last resort (SC uploader ≠ real artist)
   if (albumName) {
     queries.push(baseTitle + ' ' + albumName);
   }
@@ -422,15 +418,13 @@ async function hifiFindBestTrack(meta, albumName) {
 
   for (const q of queries) {
     try {
-      const sData = await hifiGetSafe('/search/', { s: q, limit: 20, offset: 0 });
+      const sData = await hifiGetSafe('/search/', { s: q, limit: 5, offset: 0 });
       if (!sData) continue;
 
       let items = [];
       if (sData.data && Array.isArray(sData.data.items)) items = sData.data.items;
       else if (Array.isArray(sData.items))               items = sData.items;
       else if (Array.isArray(sData.data))                items = sData.data;
-      // Filter out tracks that aren't streamable — these will always 403 on /track/
-      items = items.filter(t => t.streamReady !== false && t.allowStreaming !== false);
       if (!items.length) continue;
 
       const ranked = items.slice().sort((a, b) => {
@@ -489,12 +483,8 @@ async function hifiFindBestTrack(meta, albumName) {
          (bestArtist === wantArtist || bestArtist.includes(wantArtist)));
 
       // If we have an artist from SoundCloud, require both titleGood and artistGood.
-      // Exception: SC snippet tracks often have wrong artist (uploader != real artist).
-      // Accept exact title match even when artist doesn't match.
       if (wantArtist) {
         if (titleGood && artistGood) return best;
-        // Relaxed: exact title match is enough (handles uploader-as-artist SC metadata)
-        if (bestTitle === wantTitle) return best;
       } else {
         // No artist info from SC: still require a very strong title match.
         if (bestTitle === wantTitle) return best;
@@ -801,7 +791,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
           title:      m.title || 'Unknown',
           artist:     m.artist || 'Unknown',
           album:      null,
-          duration:   (t.full_duration || t.duration) ? Math.floor((t.full_duration || t.duration) / 1000) : null,
+          duration:   t.duration ? Math.floor(t.duration / 1000) : null,
           artworkURL: artworkUrl(t.artwork_url),
           format:     'aac'
         };
@@ -872,200 +862,57 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
       : null;
 
   // 1) Claudochrome / Hi-Fi FIRST with smarter search
-  // SC snippet tracks often encode the real artist in the title as "Artist - Song"
-  // Try that split as an alternate meta if the primary search fails
-  let _hifiBest = null;
   try {
-    _hifiBest = await hifiFindBestTrack(meta, albumName);
-    if (!_hifiBest && meta && meta.rawTitle && meta.rawTitle.includes(' - ')) {
-      const _parts = meta.rawTitle.split(' - ');
-      const _altMeta = {
-        title:    _parts.slice(1).join(' - ').trim(),
-        artist:   _parts[0].trim(),
-        uploader: meta.uploader,
-        rawTitle: meta.rawTitle
-      };
-      _hifiBest = await hifiFindBestTrack(_altMeta, albumName);
-      if (_hifiBest) console.log('[stream] HiFi found via title-split for ' + tid);
-    }
-  } catch (_fe) {
-    console.warn('[stream] hifiFindBestTrack outer error: ' + _fe.message);
-  }
-  try {
-    const best = _hifiBest;
+    const best = await hifiFindBestTrack(meta, albumName);
     if (best && best.id) {
-      const hifiId    = best.id;
-      const qList     = ['LOSSLESS', 'HIGH', 'LOW'];
-      // Build the ordered instance list once (same logic as hifiGet)
-      const instList  = instanceHealthy
-        ? [activeInstance].concat(HIFI_INSTANCES.filter(i => i !== activeInstance))
-        : HIFI_INSTANCES.slice();
+      const hifiId = best.id;
+      const qList  = ['LOSSLESS', 'HIGH', 'LOW'];
 
-      // Helper: try one instance at one quality, return parsed result or null
-      async function tryOneTrack(inst, ql) {
+      for (let qi = 0; qi < qList.length; qi++) {
+        const ql = qList[qi];
         try {
-          const r = await axios.get(inst + '/track/', {
-            params:  { id: hifiId, quality: ql },
-            headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-            timeout: 4000
-          });
-          if (r.status !== 200 || !r.data) return null;
-          const payload = r.data.data || r.data;
+          const data    = await hifiGet('/track/', { id: hifiId, quality: ql });
+          const payload = (data && data.data) ? data.data : data;
+
           if (payload && payload.manifest) {
-            const decoded = JSON.parse(Buffer.from(payload.manifest, 'base64').toString('utf8'));
-            const url     = decoded.urls && decoded.urls[0];
-            const codec   = decoded.codecs || decoded.mimeType || '';
-            if (url) return { url, codec, ql, inst };
+            const decoded = JSON.parse(
+              Buffer.from(payload.manifest, 'base64').toString('utf8')
+            );
+            const url   = (decoded.urls && decoded.urls[0]) || null;
+            const codec = decoded.codecs || decoded.mimeType || '';
+            if (url) {
+              const isFlac = codec &&
+                (codec.indexOf('flac') !== -1 || codec.indexOf('audio/flac') !== -1);
+              return res.json({
+                url,
+                format:    isFlac ? 'flac' : 'aac',
+                quality:   ql === 'LOSSLESS' ? 'lossless' : (ql === 'HIGH' ? '320kbps' : '128kbps'),
+                expiresAt: Math.floor(Date.now() / 1000) + 21600
+              });
+            }
           }
-          if (payload && payload.url) return { url: payload.url, codec: '', ql, inst };
-          return null;
-        } catch (_e) { return null; }
-      }
 
-      // Race all instances in parallel per quality tier — fastest non-null wins
-      // This ensures we never blow Vercel's 10s budget waiting for dead instances
-      let hifiResult = null;
-      for (const ql of qList) {
-        const results = await Promise.all(instList.map(inst => tryOneTrack(inst, ql)));
-        const winner  = results.find(r => r !== null);
-        if (winner) { hifiResult = winner; break; }
-      }
-
-      if (hifiResult) {
-        const isFlac = hifiResult.codec &&
-          (hifiResult.codec.indexOf('flac') !== -1 || hifiResult.codec.indexOf('audio/flac') !== -1);
-        return res.json({
-          url:       hifiResult.url,
-          format:    isFlac ? 'flac' : 'aac',
-          quality:   hifiResult.ql === 'LOSSLESS' ? 'lossless' : (hifiResult.ql === 'HIGH' ? '320kbps' : '128kbps'),
-          expiresAt: Math.floor(Date.now() / 1000) + 21600
-        });
-      }
-
-      // /track/?quality= failed on all instances — try legacy /stream/<id> (no quality param)
-      // Some instances block quality-gated endpoints from Vercel IPs but allow the legacy path
-      console.warn('[stream] Hi-Fi all qualities failed for ' + hifiId + ' (all instances parallel) — trying legacy /stream/');
-      const legacyResults = await Promise.all(instList.map(async inst => {
-        try {
-          const r = await axios.get(inst + '/stream/' + hifiId, {
-            headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-            timeout: 5000
-          });
-          if (r.data && r.data.url) {
-            console.log('[stream] HiFi legacy /stream/ hit on ' + inst + ' for ' + hifiId);
-            return { url: r.data.url, format: r.data.format || 'aac', quality: r.data.quality || 'unknown' };
+          if (payload && payload.url) {
+            return res.json({
+              url:       payload.url,
+              format:    'aac',
+              quality:   'lossless',
+              expiresAt: Math.floor(Date.now() / 1000) + 21600
+            });
           }
-          return null;
-        } catch (_e) { return null; }
-      }));
-      const legacyWinner = legacyResults.find(r => r !== null);
-      if (legacyWinner) {
-        return res.json({ ...legacyWinner, expiresAt: Math.floor(Date.now() / 1000) + 21600 });
+        } catch (e) {
+          if (qi === qList.length - 1) {
+            console.warn('[stream] Hi-Fi all qualities failed for ' + hifiId + ': ' + e.message);
+          }
+        }
       }
     }
   } catch (e) {
     console.warn('[stream] Hi-Fi error for ' + tid + ': ' + e.message);
   }
 
-  // 2) SoundCloud fallback — check if snippet first, attempt HiFi title-search if so
+  // 2) SoundCloud progressive fallback (whatever SC gives: full or snippet)
   if (track) {
-    const isSnippet = !isFullyPlayable(track) ||
-      (track.full_duration && track.duration && track.full_duration > track.duration + 5000);
-
-    if (isSnippet && meta) {
-      // HiFi direct-ID lookup already failed — try HiFi by raw title search
-      // Handles cases where SC uploader name != real TIDAL artist name
-      const titleQueries = [];
-      if (meta.rawTitle && meta.rawTitle.includes(' - ')) {
-        const parts = meta.rawTitle.split(' - ');
-        titleQueries.push(parts[0].trim() + ' ' + parts.slice(1).join(' - ').trim());
-        titleQueries.push(parts.slice(1).join(' - ').trim());
-      }
-      if (meta.artist && meta.title) titleQueries.push(meta.artist + ' ' + meta.title);
-      if (meta.title) titleQueries.push(meta.title);
-
-      for (const searchQ of titleQueries) {
-        try {
-          const sData = await hifiGetSafe('/search/', { s: searchQ, limit: 5, offset: 0 });
-          const items = (sData && sData.data && sData.data.items) ? sData.data.items
-                      : (sData && Array.isArray(sData.items)) ? sData.items : [];
-          if (!items.length) continue;
-          const norm = s => String(s).toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
-          const wantTitle = norm(meta.title);
-          // Only consider streamable tracks — non-streamable ones always 403 on /track/
-          const streamableItems = items.filter(t => t.streamReady !== false && t.allowStreaming !== false);
-          if (!streamableItems.length) continue;
-          const best = streamableItems.find(t => norm(t.title) === wantTitle) || streamableItems[0];
-          if (!best || !best.id) continue;
-          // Race all instances in parallel per quality tier (avoid sequential timeout)
-          {
-            const tsInstList = instanceHealthy
-              ? [activeInstance].concat(HIFI_INSTANCES.filter(i => i !== activeInstance))
-              : HIFI_INSTANCES.slice();
-            let tsResult = null;
-            for (const ql of ['LOSSLESS', 'HIGH', 'LOW']) {
-              const tsResults = await Promise.all(tsInstList.map(async inst => {
-                try {
-                  const r = await axios.get(inst + '/track/', {
-                    params:  { id: best.id, quality: ql },
-                    headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-                    timeout: 4000
-                  });
-                  if (r.status !== 200 || !r.data) return null;
-                  const payload = r.data.data || r.data;
-                  if (payload && payload.manifest) {
-                    const decoded = JSON.parse(Buffer.from(payload.manifest, 'base64').toString('utf8'));
-                    const url = decoded.urls && decoded.urls[0];
-                    if (url) return { url, codec: decoded.codecs || decoded.mimeType || '', ql };
-                  }
-                  if (payload && payload.url) return { url: payload.url, codec: '', ql };
-                  return null;
-                } catch (_e) { return null; }
-              }));
-              tsResult = tsResults.find(r => r !== null);
-              if (tsResult) break;
-            }
-            if (tsResult) {
-              const isFlac = tsResult.codec && (tsResult.codec.indexOf('flac') !== -1 || tsResult.codec.indexOf('audio/flac') !== -1);
-              console.log('[stream] HiFi title-search fallback hit for ' + tid + ' via "' + searchQ + '"');
-              return res.json({
-                url:       tsResult.url,
-                format:    isFlac ? 'flac' : 'aac',
-                quality:   tsResult.ql === 'LOSSLESS' ? 'lossless' : tsResult.ql === 'HIGH' ? '320kbps' : '128kbps',
-                expiresAt: Math.floor(Date.now() / 1000) + 21600
-              });
-            }
-            // /track/ blocked — try legacy /stream/<id> for this candidate
-            if (best && best.id) {
-              const legacyTsList = instanceHealthy
-                ? [activeInstance].concat(HIFI_INSTANCES.filter(i => i !== activeInstance))
-                : HIFI_INSTANCES.slice();
-              const legacyTsResults = await Promise.all(legacyTsList.map(async inst => {
-                try {
-                  const r = await axios.get(inst + '/stream/' + best.id, {
-                    headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-                    timeout: 5000
-                  });
-                  if (r.data && r.data.url) {
-                    console.log('[stream] HiFi title-search legacy /stream/ hit on ' + inst + ' for ' + best.id);
-                    return { url: r.data.url, format: r.data.format || 'aac', quality: r.data.quality || 'unknown' };
-                  }
-                  return null;
-                } catch (_e) { return null; }
-              }));
-              const legacyTsWinner = legacyTsResults.find(r => r !== null);
-              if (legacyTsWinner) {
-                return res.json({ ...legacyTsWinner, expiresAt: Math.floor(Date.now() / 1000) + 21600 });
-              }
-            }
-          }
-        } catch (_e) {}
-      }
-      console.warn('[stream] ' + tid + ' is snippet and HiFi title-search also failed');
-      return res.status(404).json({ error: 'Track is subscription-only. No full stream available.' });
-    }
-
-    // Track is fully playable on SC — serve it
     try {
       const tc   = (track.media && track.media.transcodings) || [];
       const prog = tc.find(t => t.format && t.format.protocol === 'progressive');
