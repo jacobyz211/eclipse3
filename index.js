@@ -422,13 +422,15 @@ async function hifiFindBestTrack(meta, albumName) {
 
   for (const q of queries) {
     try {
-      const sData = await hifiGetSafe('/search/', { s: q, limit: 5, offset: 0 });
+      const sData = await hifiGetSafe('/search/', { s: q, limit: 20, offset: 0 });
       if (!sData) continue;
 
       let items = [];
       if (sData.data && Array.isArray(sData.data.items)) items = sData.data.items;
       else if (Array.isArray(sData.items))               items = sData.items;
       else if (Array.isArray(sData.data))                items = sData.data;
+      // Filter out tracks that aren't streamable — these will always 403 on /track/
+      items = items.filter(t => t.streamReady !== false && t.allowStreaming !== false);
       if (!items.length) continue;
 
       const ranked = items.slice().sort((a, b) => {
@@ -990,7 +992,10 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
           if (!items.length) continue;
           const norm = s => String(s).toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
           const wantTitle = norm(meta.title);
-          const best = items.find(t => norm(t.title) === wantTitle) || items[0];
+          // Only consider streamable tracks — non-streamable ones always 403 on /track/
+          const streamableItems = items.filter(t => t.streamReady !== false && t.allowStreaming !== false);
+          if (!streamableItems.length) continue;
+          const best = streamableItems.find(t => norm(t.title) === wantTitle) || streamableItems[0];
           if (!best || !best.id) continue;
           // Race all instances in parallel per quality tier (avoid sequential timeout)
           {
@@ -1029,6 +1034,29 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
                 quality:   tsResult.ql === 'LOSSLESS' ? 'lossless' : tsResult.ql === 'HIGH' ? '320kbps' : '128kbps',
                 expiresAt: Math.floor(Date.now() / 1000) + 21600
               });
+            }
+            // /track/ blocked — try legacy /stream/<id> for this candidate
+            if (best && best.id) {
+              const legacyTsList = instanceHealthy
+                ? [activeInstance].concat(HIFI_INSTANCES.filter(i => i !== activeInstance))
+                : HIFI_INSTANCES.slice();
+              const legacyTsResults = await Promise.all(legacyTsList.map(async inst => {
+                try {
+                  const r = await axios.get(inst + '/stream/' + best.id, {
+                    headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+                    timeout: 5000
+                  });
+                  if (r.data && r.data.url) {
+                    console.log('[stream] HiFi title-search legacy /stream/ hit on ' + inst + ' for ' + best.id);
+                    return { url: r.data.url, format: r.data.format || 'aac', quality: r.data.quality || 'unknown' };
+                  }
+                  return null;
+                } catch (_e) { return null; }
+              }));
+              const legacyTsWinner = legacyTsResults.find(r => r !== null);
+              if (legacyTsWinner) {
+                return res.json({ ...legacyTsWinner, expiresAt: Math.floor(Date.now() / 1000) + 21600 });
+              }
             }
           }
         } catch (_e) {}
