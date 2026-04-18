@@ -938,8 +938,27 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
           quality:   hifiResult.ql === 'LOSSLESS' ? 'lossless' : (hifiResult.ql === 'HIGH' ? '320kbps' : '128kbps'),
           expiresAt: Math.floor(Date.now() / 1000) + 21600
         });
-      } else {
-        console.warn('[stream] Hi-Fi all qualities failed for ' + hifiId + ' (all instances parallel)');
+      }
+
+      // /track/?quality= failed on all instances — try legacy /stream/<id> (no quality param)
+      // Some instances block quality-gated endpoints from Vercel IPs but allow the legacy path
+      console.warn('[stream] Hi-Fi all qualities failed for ' + hifiId + ' (all instances parallel) — trying legacy /stream/');
+      const legacyResults = await Promise.all(instList.map(async inst => {
+        try {
+          const r = await axios.get(inst + '/stream/' + hifiId, {
+            headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+            timeout: 5000
+          });
+          if (r.data && r.data.url) {
+            console.log('[stream] HiFi legacy /stream/ hit on ' + inst + ' for ' + hifiId);
+            return { url: r.data.url, format: r.data.format || 'aac', quality: r.data.quality || 'unknown' };
+          }
+          return null;
+        } catch (_e) { return null; }
+      }));
+      const legacyWinner = legacyResults.find(r => r !== null);
+      if (legacyWinner) {
+        return res.json({ ...legacyWinner, expiresAt: Math.floor(Date.now() / 1000) + 21600 });
       }
     }
   } catch (e) {
