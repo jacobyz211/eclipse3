@@ -892,46 +892,54 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
   try {
     const best = _hifiBest;
     if (best && best.id) {
-      const hifiId = best.id;
-      const qList  = ['LOSSLESS', 'HIGH', 'LOW'];
+      const hifiId    = best.id;
+      const qList     = ['LOSSLESS', 'HIGH', 'LOW'];
+      // Build the ordered instance list once (same logic as hifiGet)
+      const instList  = instanceHealthy
+        ? [activeInstance].concat(HIFI_INSTANCES.filter(i => i !== activeInstance))
+        : HIFI_INSTANCES.slice();
 
-      for (let qi = 0; qi < qList.length; qi++) {
-        const ql = qList[qi];
+      // Helper: try one instance at one quality, return parsed result or null
+      async function tryOneTrack(inst, ql) {
         try {
-          const data    = await hifiGet('/track/', { id: hifiId, quality: ql });
-          const payload = (data && data.data) ? data.data : data;
-
+          const r = await axios.get(inst + '/track/', {
+            params:  { id: hifiId, quality: ql },
+            headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+            timeout: 4000
+          });
+          if (r.status !== 200 || !r.data) return null;
+          const payload = r.data.data || r.data;
           if (payload && payload.manifest) {
-            const decoded = JSON.parse(
-              Buffer.from(payload.manifest, 'base64').toString('utf8')
-            );
-            const url   = (decoded.urls && decoded.urls[0]) || null;
-            const codec = decoded.codecs || decoded.mimeType || '';
-            if (url) {
-              const isFlac = codec &&
-                (codec.indexOf('flac') !== -1 || codec.indexOf('audio/flac') !== -1);
-              return res.json({
-                url,
-                format:    isFlac ? 'flac' : 'aac',
-                quality:   ql === 'LOSSLESS' ? 'lossless' : (ql === 'HIGH' ? '320kbps' : '128kbps'),
-                expiresAt: Math.floor(Date.now() / 1000) + 21600
-              });
-            }
+            const decoded = JSON.parse(Buffer.from(payload.manifest, 'base64').toString('utf8'));
+            const url     = decoded.urls && decoded.urls[0];
+            const codec   = decoded.codecs || decoded.mimeType || '';
+            if (url) return { url, codec, ql, inst };
           }
+          if (payload && payload.url) return { url: payload.url, codec: '', ql, inst };
+          return null;
+        } catch (_e) { return null; }
+      }
 
-          if (payload && payload.url) {
-            return res.json({
-              url:       payload.url,
-              format:    'aac',
-              quality:   'lossless',
-              expiresAt: Math.floor(Date.now() / 1000) + 21600
-            });
-          }
-        } catch (e) {
-          if (qi === qList.length - 1) {
-            console.warn('[stream] Hi-Fi all qualities failed for ' + hifiId + ': ' + e.message);
-          }
-        }
+      // Race all instances in parallel per quality tier — fastest non-null wins
+      // This ensures we never blow Vercel's 10s budget waiting for dead instances
+      let hifiResult = null;
+      for (const ql of qList) {
+        const results = await Promise.all(instList.map(inst => tryOneTrack(inst, ql)));
+        const winner  = results.find(r => r !== null);
+        if (winner) { hifiResult = winner; break; }
+      }
+
+      if (hifiResult) {
+        const isFlac = hifiResult.codec &&
+          (hifiResult.codec.indexOf('flac') !== -1 || hifiResult.codec.indexOf('audio/flac') !== -1);
+        return res.json({
+          url:       hifiResult.url,
+          format:    isFlac ? 'flac' : 'aac',
+          quality:   hifiResult.ql === 'LOSSLESS' ? 'lossless' : (hifiResult.ql === 'HIGH' ? '320kbps' : '128kbps'),
+          expiresAt: Math.floor(Date.now() / 1000) + 21600
+        });
+      } else {
+        console.warn('[stream] Hi-Fi all qualities failed for ' + hifiId + ' (all instances parallel)');
       }
     }
   } catch (e) {
@@ -965,28 +973,44 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
           const wantTitle = norm(meta.title);
           const best = items.find(t => norm(t.title) === wantTitle) || items[0];
           if (!best || !best.id) continue;
-          for (const ql of ['LOSSLESS', 'HIGH', 'LOW']) {
-            try {
-              const data    = await hifiGet('/track/', { id: best.id, quality: ql });
-              const payload = (data && data.data) ? data.data : data;
-              if (payload && payload.manifest) {
-                const decoded = JSON.parse(Buffer.from(payload.manifest, 'base64').toString('utf8'));
-                const url     = decoded.urls && decoded.urls[0];
-                const codec   = decoded.codecs || decoded.mimeType || '';
-                if (url) {
-                  console.log('[stream] HiFi title-search fallback hit for ' + tid + ' via "' + searchQ + '"');
-                  return res.json({
-                    url,
-                    format:    (codec.indexOf('flac') !== -1 || codec.indexOf('audio/flac') !== -1) ? 'flac' : 'aac',
-                    quality:   ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '128kbps',
-                    expiresAt: Math.floor(Date.now() / 1000) + 21600
+          // Race all instances in parallel per quality tier (avoid sequential timeout)
+          {
+            const tsInstList = instanceHealthy
+              ? [activeInstance].concat(HIFI_INSTANCES.filter(i => i !== activeInstance))
+              : HIFI_INSTANCES.slice();
+            let tsResult = null;
+            for (const ql of ['LOSSLESS', 'HIGH', 'LOW']) {
+              const tsResults = await Promise.all(tsInstList.map(async inst => {
+                try {
+                  const r = await axios.get(inst + '/track/', {
+                    params:  { id: best.id, quality: ql },
+                    headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+                    timeout: 4000
                   });
-                }
-              }
-              if (payload && payload.url) {
-                return res.json({ url: payload.url, format: 'aac', quality: 'lossless', expiresAt: Math.floor(Date.now() / 1000) + 21600 });
-              }
-            } catch (_e) {}
+                  if (r.status !== 200 || !r.data) return null;
+                  const payload = r.data.data || r.data;
+                  if (payload && payload.manifest) {
+                    const decoded = JSON.parse(Buffer.from(payload.manifest, 'base64').toString('utf8'));
+                    const url = decoded.urls && decoded.urls[0];
+                    if (url) return { url, codec: decoded.codecs || decoded.mimeType || '', ql };
+                  }
+                  if (payload && payload.url) return { url: payload.url, codec: '', ql };
+                  return null;
+                } catch (_e) { return null; }
+              }));
+              tsResult = tsResults.find(r => r !== null);
+              if (tsResult) break;
+            }
+            if (tsResult) {
+              const isFlac = tsResult.codec && (tsResult.codec.indexOf('flac') !== -1 || tsResult.codec.indexOf('audio/flac') !== -1);
+              console.log('[stream] HiFi title-search fallback hit for ' + tid + ' via "' + searchQ + '"');
+              return res.json({
+                url:       tsResult.url,
+                format:    isFlac ? 'flac' : 'aac',
+                quality:   tsResult.ql === 'LOSSLESS' ? 'lossless' : tsResult.ql === 'HIGH' ? '320kbps' : '128kbps',
+                expiresAt: Math.floor(Date.now() / 1000) + 21600
+              });
+            }
           }
         } catch (_e) {}
       }
