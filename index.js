@@ -911,29 +911,62 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
     console.warn('[stream] Hi-Fi error for ' + tid + ': ' + e.message);
   }
 
-  // 2) SoundCloud progressive fallback (whatever SC gives: full or snippet)
+  // 2) SoundCloud fallback — try progressive first, then HLS
   if (track) {
-    try {
-      const tc   = (track.media && track.media.transcodings) || [];
-      const prog = tc.find(t => t.format && t.format.protocol === 'progressive');
-      if (prog && prog.url) {
-        const sd = await scGet(cid, prog.url);
-        if (sd && sd.url) {
-          const fmt = prog.format &&
-                      prog.format.mime_type &&
-                      prog.format.mime_type.indexOf('aac') !== -1
-                        ? 'aac'
-                        : 'mp3';
-          return res.json({
-            url:       sd.url,
-            format:    fmt,
-            quality:   '160kbps',
-            expiresAt: Math.floor(Date.now() / 1000) + 86400
-          });
+    const tc = (track.media && track.media.transcodings) || [];
+
+    // Helper to resolve a transcoding URL to a playable stream URL
+    async function resolveTranscoding(transcoding) {
+      const sd = await scGet(cid, transcoding.url);
+      if (!sd || !sd.url) return null;
+      const mime = (transcoding.format && transcoding.format.mime_type) || '';
+      const fmt  = mime.indexOf('aac') !== -1 ? 'aac' : 'mp3';
+      return { url: sd.url, format: fmt, quality: '160kbps', expiresAt: Math.floor(Date.now() / 1000) + 86400 };
+    }
+
+    // 2a) Progressive (direct mp3/aac URL — preferred, works in all players)
+    const progressive = tc.find(t => t.format && t.format.protocol === 'progressive');
+    if (progressive && progressive.url) {
+      try {
+        const result = await resolveTranscoding(progressive);
+        if (result) {
+          console.log('[stream] SC progressive OK for ' + tid);
+          return res.json(result);
         }
+      } catch (e) {
+        console.warn('[stream] SC progressive failed for ' + tid + ': ' + e.message);
       }
-    } catch (e) {
-      console.warn('[stream] SC progressive failed for ' + tid + ': ' + e.message);
+    }
+
+    // 2b) HLS fallback — many tracks (especially newer ones) ONLY have HLS
+    //     Eclipse handles m3u8 playlists natively so this works fine
+    const hls = tc.find(t => t.format && t.format.protocol === 'hls');
+    if (hls && hls.url) {
+      try {
+        const result = await resolveTranscoding(hls);
+        if (result) {
+          console.log('[stream] SC HLS fallback OK for ' + tid);
+          // Override format — HLS streams are m3u8 manifests
+          result.format = result.format === 'aac' ? 'aac' : 'mp3';
+          result.isHls  = true;
+          return res.json(result);
+        }
+      } catch (e) {
+        console.warn('[stream] SC HLS failed for ' + tid + ': ' + e.message);
+      }
+    }
+
+    // 2c) Last resort — any remaining transcoding
+    for (const tc_item of tc) {
+      if (!tc_item || !tc_item.url) continue;
+      if (tc_item === progressive || tc_item === hls) continue;
+      try {
+        const result = await resolveTranscoding(tc_item);
+        if (result) {
+          console.log('[stream] SC fallback (other protocol) OK for ' + tid);
+          return res.json(result);
+        }
+      } catch (e) { /* keep trying */ }
     }
   }
 
