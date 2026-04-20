@@ -494,25 +494,164 @@ async function hifiFindBestTrack(meta, albumName) {
   return null;
 }
 
-// ─── YTM playlist import (unchanged) ────────────────────────────────────────
+// ─── YTM playlist import (direct YTM browse API — full pagination) ────────────
 async function importYtmPlaylist(playlistId) {
-  const cleanId = playlistId.replace(/^VL/, '');
+  const cleanId  = playlistId.replace(/^VL/, '');
+  const browseId = 'VL' + cleanId;
+
+  const YT_KEY    = 'AIzaSyC9XL3ZjWddXya6X74dJoCTL-KOUN-VSxU';
+  const YT_CLIENT = { clientName: 'WEB_REMIX', clientVersion: '1.20240101.01.00' };
+  const YT_HEADERS = {
+    'User-Agent':   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    'Content-Type': 'application/json',
+    'Accept':       'application/json',
+    'Origin':       'https://music.youtube.com',
+    'Referer':      'https://music.youtube.com/'
+  };
+
+  // Pull track items + next continuation token out of any browse response
+  function extractItems(data) {
+    const items = [];
+    let continuation = null;
+
+    function walk(obj) {
+      if (!obj || typeof obj !== 'object') return;
+      if (Array.isArray(obj)) { obj.forEach(walk); return; }
+
+      // Track row
+      if (obj.musicResponsiveListItemRenderer) {
+        const r     = obj.musicResponsiveListItemRenderer;
+        const cols  = r.flexColumns || [];
+        const title = cols[0]
+          ?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.text || null;
+        const artist = cols[1]
+          ?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.text || 'Unknown';
+
+        // Duration
+        let duration = null;
+        const dRun = (r.fixedColumns || [])[0]
+          ?.musicResponsiveListItemFixedColumnRenderer?.text?.runs?.[0]?.text;
+        if (dRun) {
+          const parts = dRun.split(':').map(Number);
+          if (parts.length === 2) duration = parts[0] * 60 + parts[1];
+          if (parts.length === 3) duration = parts[0] * 3600 + parts[1] * 60 + parts[2];
+        }
+
+        // Video ID — try playlistItemData first, then overlay play button
+        const videoId =
+          r.playlistItemData?.videoId ||
+          r.overlay?.musicItemThumbnailOverlayRenderer?.content
+            ?.musicPlayButtonRenderer?.playNavigationEndpoint
+            ?.watchEndpoint?.videoId || null;
+
+        // Best thumbnail
+        const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails;
+        const thumb  = thumbs?.length ? thumbs[thumbs.length - 1].url : null;
+
+        if (title && videoId) {
+          items.push({
+            id:         'ytm-' + videoId,
+            title,
+            artist,
+            duration,
+            artworkURL: thumb
+          });
+        }
+        return;
+      }
+
+      // Continuation token for next page
+      if (obj.continuationItemRenderer) {
+        const token =
+          obj.continuationItemRenderer?.continuationEndpoint
+            ?.continuationCommand?.token || null;
+        if (token) continuation = token;
+        return;
+      }
+
+      for (const key of Object.keys(obj)) walk(obj[key]);
+    }
+
+    walk(data);
+    return { items, continuation };
+  }
+
+  // Pull playlist title + author + artwork out of the first response
+  function extractMeta(data) {
+    let title = 'YouTube Music Playlist', creator = 'YouTube Music', artwork = null;
+
+    function walk(obj) {
+      if (!obj || typeof obj !== 'object') return;
+      if (Array.isArray(obj)) { obj.forEach(walk); return; }
+
+      const hdr =
+        obj.musicImmersiveHeaderRenderer ||
+        obj.musicDetailHeaderRenderer ||
+        obj.musicEditablePlaylistDetailHeaderRenderer?.header?.musicImmersiveHeaderRenderer ||
+        obj.musicEditablePlaylistDetailHeaderRenderer?.header?.musicDetailHeaderRenderer;
+
+      if (hdr) {
+        if (hdr.title?.runs?.[0]?.text)   title   = hdr.title.runs[0].text;
+        if (hdr.subtitle?.runs)           creator = hdr.subtitle.runs.map(r => r.text || '').join('');
+        const tn = hdr.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails;
+        if (tn?.length) artwork = tn[tn.length - 1].url;
+        return;
+      }
+
+      for (const key of Object.keys(obj)) walk(obj[key]);
+    }
+
+    walk(data);
+    return { title, creator, artwork };
+  }
+
   try {
-    const pl = await ytpl(cleanId, { limit: Infinity });
+    // ── First page ────────────────────────────────────────────────────────────
+    const initRes = await axios.post(
+      'https://music.youtube.com/youtubei/v1/browse?key=' + YT_KEY,
+      { browseId, context: { client: YT_CLIENT } },
+      { headers: YT_HEADERS, timeout: 20000 }
+    );
+
+    const meta   = extractMeta(initRes.data);
+    const first  = extractItems(initRes.data);
+    const tracks = [...first.items];
+    let cont     = first.continuation;
+
+    // ── Follow continuation pages until exhausted ─────────────────────────────
+    let guard = 200; // max pages safety cap
+    while (cont && guard-- > 0) {
+      try {
+        const pageRes = await axios.post(
+          'https://music.youtube.com/youtubei/v1/browse?key=' + YT_KEY,
+          { continuation: cont, context: { client: YT_CLIENT } },
+          { headers: YT_HEADERS, timeout: 20000 }
+        );
+        const page = extractItems(pageRes.data);
+        tracks.push(...page.items);
+        cont = page.continuation || null;
+      } catch (pageErr) {
+        console.warn('[ytm] continuation page failed:', pageErr.message);
+        break;
+      }
+    }
+
+    if (!tracks.length) {
+      throw new Error('No tracks found. Make sure the playlist is Public.');
+    }
+
     return {
       id:         'ytm-' + cleanId,
-      title:      pl.title || 'YouTube Music Playlist',
-      artworkURL: pl.bestThumbnail ? pl.bestThumbnail.url : null,
-      creator:    pl.author ? pl.author.name : 'YouTube Music',
-      tracks:     pl.items.map(item => ({
-        id:         'ytm-' + item.id,
-        title:      item.title || 'Unknown',
-        artist:     (item.author && item.author.name) || 'Unknown',
-        duration:   item.durationSec || null,
-        artworkURL: item.bestThumbnail ? item.bestThumbnail.url : null
-      }))
+      title:      meta.title,
+      artworkURL: meta.artwork,
+      creator:    meta.creator,
+      tracks
     };
+
   } catch (e) {
+    if (e.response?.status === 404) {
+      throw new Error('Playlist not found. Make sure it is Public and the URL is correct.');
+    }
     throw new Error('Could not fetch YouTube playlist: ' + e.message + '. Make sure it is Public.');
   }
 }
