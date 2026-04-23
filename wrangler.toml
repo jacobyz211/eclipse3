@@ -1,0 +1,15 @@
+name = "eclipse3"
+main = "index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Optional: override any of these via `wrangler secret put`
+# SC_CLIENT_ID = ""
+# REDIS_URL = ""   # Upstash Redis REST URL (https://...)
+# REDIS_TOKEN = "" # Upstash Redis REST token
+
+# Uncomment to add KV namespace for caching instead of Upstash:
+# [[kv_namespaces]]
+# binding = "ECLIPSE_KV"
+# id = "YOUR_KV_NAMESPACE_ID"
