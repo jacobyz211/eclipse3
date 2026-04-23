@@ -10,13 +10,20 @@ app.use('*', cors());
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const DEFAULT_HIFI_INSTANCES = [
-  'https://tidal-api.binimum.org',
+  'https://hifi-api-pj08.onrender.com',
   'https://ohio-1.monochrome.tf',
   'https://frankfurt-1.monochrome.tf',
+  'https://vogel.qqdl.site',
+  'https://tidal-api.binimum.org',
   'https://eu-central.monochrome.tf',
   'https://us-west.monochrome.tf',
   'https://hifi.geeked.wtf',
-  'https://monochrome-api.samidy.com'
+  'https://monochrome-api.samidy.com',
+  'https://hifi-two.spotisaver.net',
+  'https://wolf.qqdl.site',
+  'https://katze.qqdl.site',
+  'https://hund.qqdl.site',
+  'https://api.monochrome.tf',
 ];
 
 // ─── In-memory caches (per isolate) ─────────────────────────────────────────
