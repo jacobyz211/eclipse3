@@ -251,17 +251,19 @@ async function httpPost(url, body, headers, timeout) {
 async function hifiGet(env, path, params) {
   const instances = env.HIFI_INSTANCES
     ? env.HIFI_INSTANCES.split(',').map(s => s.trim()).filter(Boolean)
-    : DEFAULT_HIFI_INSTANCES;
-  const errors = [];
-  for (const inst of instances) {
-    try {
-      const data = await httpGet(inst + path, params || {});
-      if (data) return data;
-    } catch (e) {
-      errors.push(inst + ': ' + e.message);
-    }
-  }
-  throw new Error('All HiFi instances failed: ' + errors.slice(-2).join(' | '));
+    : DEFAULT_HIFI_INSTANCES.slice(0, 5); // Max 5 to avoid timeout
+
+  const promises = instances.map(inst =>
+    httpGet(inst + path, params || {}, {}, 3000) // 3s per instance
+      .then(data => ({ data, inst }))
+      .catch(() => null)
+  );
+
+  const results = await Promise.all(promises);
+  const first = results.find(r => r && r.data);
+  if (first) return first.data;
+
+  throw new Error('HiFi unavailable');
 }
 
 async function hifiGetSafe(env, path, params) {
